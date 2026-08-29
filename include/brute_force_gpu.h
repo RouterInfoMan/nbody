@@ -1,0 +1,38 @@
+#pragma once
+#include "simulation.h"
+#include "preset.h"
+#include "shader.h"
+#include <GL/glew.h>
+#include <memory>
+
+class BruteForceGPU : public Simulation {
+public:
+    BruteForceGPU(std::unique_ptr<Preset> preset, float G = 1.0f, float softening = 1.0f);
+    ~BruteForceGPU();
+
+    void step(float dt) override;
+    void reset() override;
+    const char* name() const override { return "Brute Force (GPU)"; }
+
+private:
+    std::unique_ptr<Preset> preset;
+    float G;
+    float softening;
+
+    std::unique_ptr<Shader> force_shader;
+    std::unique_ptr<Shader> verlet1_shader;
+    std::unique_ptr<Shader> verlet2_shader;
+
+    GLuint pos_ssbo = 0;
+    GLuint vel_ssbo = 0;
+    GLuint acc_ssbo = 0;
+    GLuint mass_ssbo = 0;
+    int gpu_particle_count = 0;
+
+    static constexpr int WORKGROUP_SIZE = 256;
+
+    void allocateBuffers();
+    void freeBuffers();
+    void uploadToGPU();
+    void downloadFromGPU();
+};

@@ -1,0 +1,48 @@
+#version 430 core
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer PositionBuffer     { vec2 positions[]; };
+layout(std430, binding = 1) buffer VelocityBuffer      { vec2 velocities[]; };
+layout(std430, binding = 2) buffer AccelerationBuffer  { vec2 accelerations[]; };
+layout(std430, binding = 3) buffer MassBuffer          { float masses[]; };
+
+uniform int particleCount;
+uniform float softening;
+uniform float G;
+
+shared vec4 tile[256]; // xy = position, z = mass
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= particleCount) return;
+
+    vec2 myPos = positions[i];
+    vec2 force = vec2(0.0);
+
+    int numTiles = (particleCount + 255) / 256;
+
+    for (int t = 0; t < numTiles; t++) {
+        uint idx = t * 256 + gl_LocalInvocationID.x;
+
+        if (idx < particleCount)
+            tile[gl_LocalInvocationID.x] = vec4(positions[idx], masses[idx], 0.0);
+        else
+            tile[gl_LocalInvocationID.x] = vec4(0.0);
+
+        barrier();
+
+        int tileEnd = min(256, particleCount - t * 256);
+        for (int j = 0; j < tileEnd; j++) {
+            vec2 d = tile[j].xy - myPos;
+            float distSqr = dot(d, d) + softening * softening;
+            float invDist = inversesqrt(distSqr);
+            float invDist3 = invDist * invDist * invDist;
+            force += d * (tile[j].z * invDist3);
+        }
+
+        barrier();
+    }
+
+    accelerations[i] = force * G;
+}
