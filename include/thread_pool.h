@@ -51,7 +51,7 @@ public:
             return;
         }
 
-        std::atomic<int> remaining(num);
+        int remaining = num;
         std::mutex done_mtx;
         std::condition_variable done_cv;
 
@@ -66,9 +66,10 @@ public:
 
             {
                 std::unique_lock<std::mutex> lock(mtx);
-                tasks.push([&fn, &remaining, &done_cv, start, count] {
+                tasks.push([&fn, &remaining, &done_cv, &done_mtx, start, count] {
                     fn(start, start + count);
-                    if (remaining.fetch_sub(1) == 1)
+                    std::lock_guard<std::mutex> lk(done_mtx);
+                    if (--remaining == 0)
                         done_cv.notify_one();
                 });
             }
@@ -76,7 +77,7 @@ public:
         }
 
         std::unique_lock<std::mutex> lock(done_mtx);
-        done_cv.wait(lock, [&remaining] { return remaining.load() == 0; });
+        done_cv.wait(lock, [&remaining] { return remaining == 0; });
     }
 
 private:
