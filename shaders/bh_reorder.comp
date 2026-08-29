@@ -1,0 +1,29 @@
+#version 430 core
+
+// Permutes particle state into Morton order. Applying the sort permutation to
+// the live state (rather than keeping an indirection table) means leaf ranges
+// and traversal reads stay contiguous, which is where most of the traversal
+// speedup comes from. Verlet is per-particle, so a global relabelling between
+// steps is physically a no-op.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SrcPosBuffer  { vec2 srcPos[]; };
+layout(std430, binding = 1) readonly buffer SrcVelBuffer  { vec2 srcVel[]; };
+layout(std430, binding = 2) readonly buffer SrcMassBuffer { float srcMass[]; };
+layout(std430, binding = 3) readonly buffer IndexBuffer   { uint indices[]; };
+layout(std430, binding = 4) writeonly buffer DstPosBuffer  { vec2 dstPos[]; };
+layout(std430, binding = 5) writeonly buffer DstVelBuffer  { vec2 dstVel[]; };
+layout(std430, binding = 6) writeonly buffer DstMassBuffer { float dstMass[]; };
+
+uniform int particleCount;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(particleCount)) return;
+
+    uint src = indices[i];
+    dstPos[i] = srcPos[src];
+    dstVel[i] = srcVel[src];
+    dstMass[i] = srcMass[src];
+}

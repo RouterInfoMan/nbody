@@ -1,0 +1,60 @@
+#version 430 core
+
+// Bottom-up centre-of-mass and AABB propagation.
+//
+// One thread per leaf. Each thread seeds its leaf then walks toward the root,
+// atomically incrementing a per-node arrival counter. The first child to
+// arrive at a node exits; the second finds both children complete and merges
+// them, so every internal node is written exactly once, by whichever child
+// finished last.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 1) readonly buffer MassBuffer     { float masses[]; };
+layout(std430, binding = 2) readonly buffer LeftBuffer     { uint nodeLeft[]; };
+layout(std430, binding = 3) readonly buffer RightBuffer    { uint nodeRight[]; };
+layout(std430, binding = 4) readonly buffer ParentBuffer   { uint nodeParent[]; };
+layout(std430, binding = 5) coherent buffer ComBuffer      { vec4 nodeCom[]; };
+layout(std430, binding = 6) coherent buffer AabbBuffer     { vec4 nodeAabb[]; };
+layout(std430, binding = 7) coherent buffer FlagBuffer     { uint nodeFlags[]; };
+
+uniform int particleCount;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= uint(particleCount)) return;
+
+    uint leaf = uint(particleCount - 1) + k;
+    vec2 p = positions[k];
+    float m = masses[k];
+
+    nodeCom[leaf] = vec4(p, m, 0.0);
+    nodeAabb[leaf] = vec4(p, p);
+
+    memoryBarrierBuffer();
+
+    uint node = nodeParent[leaf];
+    while (node != 0xFFFFFFFFu) {
+        // First arrival leaves the merge to the sibling.
+        if (atomicAdd(nodeFlags[node], 1u) == 0u) return;
+        memoryBarrierBuffer();
+
+        uint l = nodeLeft[node];
+        uint r = nodeRight[node];
+
+        vec4 cl = nodeCom[l];
+        vec4 cr = nodeCom[r];
+        float total = cl.z + cr.z;
+        vec2 com = (total > 0.0) ? (cl.xy * cl.z + cr.xy * cr.z) / total
+                                 : 0.5 * (cl.xy + cr.xy);
+        nodeCom[node] = vec4(com, total, 0.0);
+
+        vec4 al = nodeAabb[l];
+        vec4 ar = nodeAabb[r];
+        nodeAabb[node] = vec4(min(al.xy, ar.xy), max(al.zw, ar.zw));
+
+        memoryBarrierBuffer();
+        node = nodeParent[node];
+    }
+}

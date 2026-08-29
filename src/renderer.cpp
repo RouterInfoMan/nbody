@@ -54,6 +54,57 @@ void Renderer::render(const std::vector<Particle>& particles, const Camera2D& ca
     glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(particles.size()));
 }
 
+void Renderer::renderFromGPU(GLuint pos_ssbo, GLuint vel_ssbo, int count, const Camera2D& camera) {
+    // GPU-resident solvers already require GL 4.3 compute, so this path is
+    // only reachable when compute is available.
+    if (count <= 0 || !pos_ssbo || !use_compute) return;
+
+    if (show_velocity && vel_ssbo) {
+        ensureVertexCapacity(static_cast<size_t>(count));
+
+        compute_shader->use();
+        compute_shader->set_int("particleCount", count);
+
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, pos_ssbo);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, vel_ssbo);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, particle_vbo);
+
+        glDispatchCompute(static_cast<GLuint>((count + 255) / 256), 1, 1);
+        glMemoryBarrier(GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+    } else {
+        // No colouring pass available: fold positions into the vertex layout
+        // with a flat colour so the draw call below stays identical.
+        ensureVertexCapacity(static_cast<size_t>(count));
+
+        if (!flat_shader)
+            flat_shader = std::make_unique<Shader>("shaders/particle_gather.comp");
+
+        flat_shader->use();
+        flat_shader->set_int("particleCount", count);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, pos_ssbo);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, particle_vbo);
+        glDispatchCompute(static_cast<GLuint>((count + 255) / 256), 1, 1);
+        glMemoryBarrier(GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT);
+    }
+
+    last_particle_count = static_cast<size_t>(count);
+    needs_update = false;
+
+    particle_shader->use();
+    particle_shader->set_mat4("projection", camera.getProjectionMatrix());
+    particle_shader->set_float("pointSize", particle_size);
+
+    glBindVertexArray(particle_vao);
+    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(count));
+}
+
+void Renderer::ensureVertexCapacity(size_t count) {
+    if (count <= vertex_capacity) return;
+    glBindBuffer(GL_ARRAY_BUFFER, particle_vbo);
+    glBufferData(GL_ARRAY_BUFFER, count * 6 * sizeof(float), nullptr, GL_STREAM_DRAW);
+    vertex_capacity = count;
+}
+
 void Renderer::updateBufferCompute(const std::vector<Particle>& particles) {
     size_t n = particles.size();
 
@@ -72,6 +123,7 @@ void Renderer::updateBufferCompute(const std::vector<Particle>& particles) {
 
     glBindBuffer(GL_ARRAY_BUFFER, particle_vbo);
     glBufferData(GL_ARRAY_BUFFER, n * 6 * sizeof(float), nullptr, GL_STREAM_DRAW);
+    vertex_capacity = n;
 
     compute_shader->use();
     compute_shader->set_int("particleCount", static_cast<int>(n));
@@ -103,6 +155,7 @@ void Renderer::updateBufferCPU(const std::vector<Particle>& particles) {
 
     glBindBuffer(GL_ARRAY_BUFFER, particle_vbo);
     glBufferData(GL_ARRAY_BUFFER, data.size() * sizeof(float), data.data(), GL_STREAM_DRAW);
+    vertex_capacity = particles.size();
 }
 
 void Renderer::setupBuffers() {

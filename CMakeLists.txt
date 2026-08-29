@@ -49,6 +49,9 @@ add_executable(nbody
     src/brute_force_cpu.cpp
     src/brute_force_gpu.cpp
     src/barnes_hut_cpu.cpp
+    src/barnes_hut_gpu.cpp
+    src/gpu_radix_sort.cpp
+    src/fmm_cpu.cpp
     src/galaxy_preset.cpp
     src/collapse_preset.cpp
     ${IMGUI_SOURCES}
@@ -66,6 +69,25 @@ target_link_libraries(nbody PRIVATE
     GLEW::GLEW
     glm::glm
 )
+
+# Correctness harness: checks every tree solver against a direct N-body sum.
+add_executable(solver_check
+    tests/solver_check.cpp
+    src/shader.cpp
+    src/camera.cpp
+    src/renderer.cpp
+    src/brute_force_cpu.cpp
+    src/brute_force_gpu.cpp
+    src/barnes_hut_cpu.cpp
+    src/barnes_hut_gpu.cpp
+    src/gpu_radix_sort.cpp
+    src/fmm_cpu.cpp
+    src/galaxy_preset.cpp
+    src/collapse_preset.cpp
+)
+
+target_include_directories(solver_check PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(solver_check PRIVATE OpenGL::GL glfw GLEW::GLEW glm::glm)
 
 # Copy shaders to build directory
 file(COPY ${CMAKE_SOURCE_DIR}/shaders DESTINATION ${CMAKE_BINARY_DIR})

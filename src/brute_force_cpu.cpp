@@ -9,6 +9,7 @@ BruteForceCPU::BruteForceCPU(std::unique_ptr<Preset> preset, float G, float soft
 void BruteForceCPU::reset() {
     current_time = 0.0f;
     preset->apply(particles);
+    setParticleCount(static_cast<int>(particles.size()));
 }
 
 void BruteForceCPU::step(float dt) {

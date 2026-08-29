@@ -1,0 +1,41 @@
+#version 430 core
+
+// Pass 1 of a 4-bit LSD radix sort: per-block digit histogram.
+// Output is bin-major (hist[bin * numBlocks + block]) so that the global
+// exclusive scan in radix_scan.comp walks it contiguously and lands each
+// block's starting offset for each digit exactly where the scatter needs it.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KeyBuffer   { uint keys[]; };
+layout(std430, binding = 1) writeonly buffer HistBuffer { uint hist[]; };
+
+uniform int particleCount;
+uniform int numBlocks;
+uniform int shiftBits;
+
+const uint ITEMS_PER_THREAD = 8u;
+const uint BLOCK_SIZE = 2048u;   // 256 threads * 8 items
+
+shared uint s_hist[16];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+
+    if (lid < 16u) s_hist[lid] = 0u;
+    barrier();
+
+    uint base = block * BLOCK_SIZE + lid * ITEMS_PER_THREAD;
+    for (uint i = 0u; i < ITEMS_PER_THREAD; i++) {
+        uint idx = base + i;
+        if (idx < uint(particleCount)) {
+            uint digit = (keys[idx] >> uint(shiftBits)) & 15u;
+            atomicAdd(s_hist[digit], 1u);
+        }
+    }
+    barrier();
+
+    if (lid < 16u)
+        hist[lid * uint(numBlocks) + block] = s_hist[lid];
+}

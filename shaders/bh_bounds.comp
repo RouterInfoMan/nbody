@@ -1,0 +1,45 @@
+#version 430 core
+
+// Parallel AABB reduction over all particle positions.
+// Floats are mapped to an order-preserving uint key so atomicMin/atomicMax
+// (which GLSL only provides for integers) reproduce float ordering exactly.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 1) coherent buffer BoundsBuffer   { uint bounds[]; };
+
+uniform int particleCount;
+
+uint floatToKey(float f) {
+    uint u = floatBitsToUint(f);
+    return ((u & 0x80000000u) != 0u) ? ~u : (u | 0x80000000u);
+}
+
+shared uint s_min[2];
+shared uint s_max[2];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+
+    if (lid < 2u) {
+        s_min[lid] = 0xFFFFFFFFu;
+        s_max[lid] = 0u;
+    }
+    barrier();
+
+    uint i = gl_GlobalInvocationID.x;
+    if (i < uint(particleCount)) {
+        vec2 p = positions[i];
+        atomicMin(s_min[0], floatToKey(p.x));
+        atomicMin(s_min[1], floatToKey(p.y));
+        atomicMax(s_max[0], floatToKey(p.x));
+        atomicMax(s_max[1], floatToKey(p.y));
+    }
+    barrier();
+
+    if (lid < 2u) {
+        atomicMin(bounds[lid],      s_min[lid]);
+        atomicMax(bounds[2u + lid], s_max[lid]);
+    }
+}

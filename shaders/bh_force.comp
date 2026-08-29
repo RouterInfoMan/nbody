@@ -1,0 +1,74 @@
+#version 430 core
+
+// Barnes-Hut traversal over the LBVH, one thread per particle.
+//
+// Node size for the opening angle is the AABB diagonal. The longest edge is
+// the cheaper choice but it is markedly less conservative than the quadtree
+// cell width the CPU solver tests against, which made the same theta mean
+// noticeably different accuracy in the two implementations. The diagonal
+// bounds the node the way a cell width does, so theta is calibrated the same
+// way in both and the two solvers are directly comparable.
+//
+// Leaves hold exactly one particle, so a leaf's "multipole" is that particle
+// and no direct-sum inner loop is needed. A particle's own leaf contributes
+// d = 0, hence exactly zero -- the same as brute force, which also does not
+// special-case self-interaction and relies on softening.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 1) readonly buffer ComBuffer      { vec4 nodeCom[]; };
+layout(std430, binding = 2) readonly buffer AabbBuffer     { vec4 nodeAabb[]; };
+layout(std430, binding = 3) readonly buffer LeftBuffer     { uint nodeLeft[]; };
+layout(std430, binding = 4) readonly buffer RightBuffer    { uint nodeRight[]; };
+layout(std430, binding = 5) writeonly buffer AccelBuffer   { vec2 accelerations[]; };
+
+uniform int particleCount;
+uniform float thetaSq;
+uniform float softeningSq;
+uniform float G;
+
+const int STACK_SIZE = 64;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(particleCount)) return;
+
+    vec2 p = positions[gid];
+    vec2 acc = vec2(0.0);
+
+    int internalCount = particleCount - 1;
+
+    int stack[STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = 0;   // root
+
+    while (sp > 0) {
+        int node = stack[--sp];
+
+        vec4 c = nodeCom[node];
+        vec2 d = c.xy - p;
+        float distSq = dot(d, d);
+
+        bool isLeaf = node >= internalCount;
+
+        bool accept = isLeaf;
+        if (!isLeaf) {
+            vec4 bb = nodeAabb[node];
+            vec2 ext = bb.zw - bb.xy;
+            // Falling back to the multipole on stack exhaustion keeps total
+            // mass exact; dropping the node instead would lose it.
+            accept = (dot(ext, ext) < distSq * thetaSq) || (sp + 2 > STACK_SIZE);
+        }
+
+        if (accept) {
+            float invDist = inversesqrt(max(distSq + softeningSq, 1e-20));
+            acc += d * (c.z * invDist * invDist * invDist);
+        } else {
+            stack[sp++] = int(nodeLeft[node]);
+            stack[sp++] = int(nodeRight[node]);
+        }
+    }
+
+    accelerations[gid] = acc * G;
+}

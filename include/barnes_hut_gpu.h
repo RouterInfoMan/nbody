@@ -1,0 +1,87 @@
+#pragma once
+#include "simulation.h"
+#include "preset.h"
+#include "shader.h"
+#include "gpu_radix_sort.h"
+#include <GL/glew.h>
+#include <memory>
+
+// Barnes-Hut on the GPU via a linear BVH (Karras 2012).
+//
+// Per step, entirely on device:
+//   verlet drift  ->  AABB reduce  ->  Morton codes  ->  radix sort
+//   ->  permute state into Morton order  ->  parallel radix tree
+//   ->  bottom-up COM/AABB  ->  traversal  ->  verlet kick
+//
+// Nothing is read back; the renderer draws out of these buffers directly.
+class BarnesHutGPU : public Simulation {
+public:
+    BarnesHutGPU(std::unique_ptr<Preset> preset, float theta = 0.5f,
+                 float G = 1.0f, float softening = 1.0f);
+    ~BarnesHutGPU();
+
+    void step(float dt) override;
+    void reset() override;
+    const char* name() const override { return "Barnes-Hut (GPU)"; }
+
+    bool isGPUResident() const override { return true; }
+    GLuint positionBuffer() const override { return pos_ssbo[cur]; }
+    GLuint velocityBuffer() const override { return vel_ssbo[cur]; }
+    void syncToHost() override;
+
+    void setPhysics(float g, float soft) override { G = g; softening = soft; }
+    void setTheta(float t) override { theta = t; }
+
+private:
+    std::unique_ptr<Preset> preset;
+
+    float theta;
+    float G;
+    float softening;
+
+    std::unique_ptr<Shader> bounds_shader;
+    std::unique_ptr<Shader> morton_shader;
+    std::unique_ptr<Shader> reorder_shader;
+    std::unique_ptr<Shader> karras_shader;
+    std::unique_ptr<Shader> propagate_shader;
+    std::unique_ptr<Shader> force_shader;
+    std::unique_ptr<Shader> verlet1_shader;
+    std::unique_ptr<Shader> verlet2_shader;
+
+    GpuRadixSort sorter;
+
+    // Particle state, double buffered because the Morton permutation is
+    // applied to the live arrays every step.
+    GLuint pos_ssbo[2] = {0, 0};
+    GLuint vel_ssbo[2] = {0, 0};
+    GLuint mass_ssbo[2] = {0, 0};
+    int cur = 0;
+
+    GLuint acc_ssbo = 0;
+    GLuint key_ssbo[2] = {0, 0};
+    GLuint val_ssbo[2] = {0, 0};
+    GLuint bounds_ssbo = 0;
+
+    // Node layout: [0, n-1) internal, [n-1, 2n-1) leaves.
+    GLuint node_left_ssbo = 0;
+    GLuint node_right_ssbo = 0;
+    GLuint node_parent_ssbo = 0;
+    GLuint node_com_ssbo = 0;
+    GLuint node_aabb_ssbo = 0;
+    GLuint node_flags_ssbo = 0;
+
+    static constexpr int WORKGROUP_SIZE = 256;
+    static constexpr GLuint NO_PARENT = 0xFFFFFFFFu;
+
+    void allocateBuffers();
+    void freeBuffers();
+    void uploadToGPU();
+
+    // Everything between the two Verlet halves: rebuilds the tree from the
+    // current positions and writes fresh accelerations.
+    void buildTreeAndComputeForces();
+
+    GLuint groupCount(int n) const {
+        return static_cast<GLuint>((n + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE);
+    }
+};

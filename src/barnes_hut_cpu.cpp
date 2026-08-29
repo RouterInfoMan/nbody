@@ -22,6 +22,7 @@ BarnesHutCPU::BarnesHutCPU(std::unique_ptr<Preset> preset, float theta,
 void BarnesHutCPU::reset() {
     current_time = 0.0f;
     preset->apply(particles);
+    setParticleCount(static_cast<int>(particles.size()));
 }
 
 void BarnesHutCPU::step(float dt) {

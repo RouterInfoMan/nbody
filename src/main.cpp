@@ -13,8 +13,14 @@
 #include "brute_force_cpu.h"
 #include "brute_force_gpu.h"
 #include "barnes_hut_cpu.h"
+#include "barnes_hut_gpu.h"
+#include "fmm_cpu.h"
 #include "galaxy_preset.h"
 #include "collapse_preset.h"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 static const int INIT_WIDTH = 1280;
 static const int INIT_HEIGHT = 720;
@@ -23,6 +29,8 @@ enum Algorithm {
     ALG_BRUTE_CPU,
     ALG_BRUTE_GPU,
     ALG_BARNES_HUT_CPU,
+    ALG_BARNES_HUT_GPU,
+    ALG_FMM_CPU,
     ALG_COUNT
 };
 
@@ -30,6 +38,13 @@ static const char* ALG_NAMES[] = {
     "Brute Force (CPU)",
     "Brute Force (GPU - Compute Shader)",
     "Barnes-Hut (CPU)",
+    "Barnes-Hut (GPU - LBVH)",
+    "FMM (CPU)",
+};
+
+static const char* FMM_KERNEL_NAMES[] = {
+    "Softened 1/r^2 (matches other solvers)",
+    "Logarithmic (true 2D gravity)",
 };
 
 enum PresetType {
@@ -126,8 +141,11 @@ public:
             processInput(delta);
 
             auto t0 = std::chrono::high_resolution_clock::now();
-            if (!paused && simulation)
+            if (!paused && simulation) {
                 simulation->step(dt * time_scale);
+                if (sync_gpu_timing && simulation->isGPUResident())
+                    glFinish();
+            }
             auto t1 = std::chrono::high_resolution_clock::now();
             sim_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -165,6 +183,19 @@ private:
     float sim_softening = 1.0f;
     float sim_theta = 0.5f;
 
+    int fmm_kernel = 0;
+    int fmm_order = 4;
+    int fmm_leaf_capacity = 32;
+    int fmm_depth = 0;          // 0 = auto
+
+    // GPU solvers no longer stall on a readback, so timing them needs an
+    // explicit sync; without it sim_ms would only measure command submission.
+    bool sync_gpu_timing = true;
+
+    float err_max = -1.0f;
+    float err_rms = -1.0f;
+    int err_samples = 0;
+
     void createSimulation() {
         auto preset = makePreset();
 
@@ -178,9 +209,67 @@ private:
             case ALG_BARNES_HUT_CPU:
                 simulation = std::make_unique<BarnesHutCPU>(std::move(preset), sim_theta, sim_G, sim_softening);
                 break;
+            case ALG_BARNES_HUT_GPU:
+                simulation = std::make_unique<BarnesHutGPU>(std::move(preset), sim_theta, sim_G, sim_softening);
+                break;
+            case ALG_FMM_CPU: {
+                auto fmm = std::make_unique<FMMCPU>(
+                    std::move(preset),
+                    fmm_kernel == 0 ? FMMKernel::Softened : FMMKernel::Logarithmic,
+                    fmm_order, fmm_leaf_capacity, sim_G, sim_softening);
+                if (fmm_depth > 0) fmm->setDepth(fmm_depth);
+                simulation = std::move(fmm);
+                break;
+            }
         }
 
+        err_max = err_rms = -1.0f;
+        err_samples = 0;
         renderer->setNeedsUpdate(true);
+    }
+
+    // Compares the solver's current accelerations against a direct sum over
+    // every particle, for an evenly spaced sample of targets. The state is
+    // already consistent after a step (positions were advanced, then forces
+    // recomputed at those positions), so no extra stepping is needed.
+    void validateAgainstBruteForce() {
+        if (!simulation) return;
+
+        simulation->syncToHost();
+        const std::vector<Particle>& ps = simulation->getParticles();
+        const int n = static_cast<int>(ps.size());
+        if (n == 0) return;
+
+        const int samples = std::min(n, 1024);
+        const int step_size = std::max(1, n / samples);
+        const float eps_sq = sim_softening * sim_softening;
+
+        double sum_sq = 0.0;
+        double worst = 0.0;
+        int counted = 0;
+
+        for (int i = 0; i < n; i += step_size) {
+            glm::vec2 ref(0.0f);
+            for (int j = 0; j < n; j++) {
+                glm::vec2 d = ps[j].position - ps[i].position;
+                float r2 = glm::dot(d, d) + eps_sq;
+                float inv = 1.0f / std::sqrt(r2);
+                ref += d * (ps[j].mass * inv * inv * inv);
+            }
+            ref *= sim_G;
+
+            const float ref_mag = glm::length(ref);
+            if (ref_mag < 1e-12f) continue;
+
+            const float rel = glm::length(ps[i].acceleration - ref) / ref_mag;
+            worst = std::max(worst, double(rel));
+            sum_sq += double(rel) * double(rel);
+            counted++;
+        }
+
+        err_samples = counted;
+        err_max = counted ? float(worst) : -1.0f;
+        err_rms = counted ? float(std::sqrt(sum_sq / counted)) : -1.0f;
     }
 
     std::unique_ptr<Preset> makePreset() {
@@ -248,9 +337,15 @@ private:
         glClearColor(0.05f, 0.05f, 0.1f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        if (simulation) {
-            const auto& p = simulation->getParticles();
-            renderer->render(p, *camera, !paused);
+        if (!simulation) return;
+
+        if (simulation->isGPUResident()) {
+            renderer->renderFromGPU(simulation->positionBuffer(),
+                                    simulation->velocityBuffer(),
+                                    simulation->getParticleCount(),
+                                    *camera);
+        } else {
+            renderer->render(simulation->getParticles(), *camera, !paused);
         }
     }
 
@@ -267,8 +362,30 @@ private:
         ImGui::SeparatorText("Algorithm");
         bool alg_changed = ImGui::Combo("Algorithm", &current_alg, ALG_NAMES, ALG_COUNT);
 
-        if (current_alg == ALG_BARNES_HUT_CPU)
-            ImGui::SliderFloat("Theta", &sim_theta, 0.1f, 2.0f, "%.2f");
+        const bool is_bh = current_alg == ALG_BARNES_HUT_CPU || current_alg == ALG_BARNES_HUT_GPU;
+        bool rebuild_needed = false;
+
+        if (is_bh) {
+            if (ImGui::SliderFloat("Theta", &sim_theta, 0.1f, 2.0f, "%.2f") && simulation)
+                simulation->setTheta(sim_theta);
+        }
+
+        if (current_alg == ALG_FMM_CPU) {
+            rebuild_needed |= ImGui::Combo("Kernel", &fmm_kernel, FMM_KERNEL_NAMES, 2);
+
+            const int max_order = (fmm_kernel == 0) ? 6 : 15;
+            fmm_order = std::min(fmm_order, max_order);
+            rebuild_needed |= ImGui::SliderInt("Order (p)", &fmm_order, 1, max_order);
+            rebuild_needed |= ImGui::SliderInt("Leaf Capacity", &fmm_leaf_capacity, 4, 256);
+
+            int auto_depth = FMMCPU::autoDepth(particle_count, fmm_leaf_capacity);
+            rebuild_needed |= ImGui::SliderInt("Depth (0 = auto)", &fmm_depth, 0, 12);
+            ImGui::TextDisabled("Auto depth for these settings: %d", auto_depth);
+
+            if (fmm_kernel == 1)
+                ImGui::TextDisabled("Log kernel is a different force law -- it will not\n"
+                                    "agree with brute force, and validation is meaningless.");
+        }
 
         // Preset selection
         ImGui::SeparatorText("Preset");
@@ -280,12 +397,16 @@ private:
 
         // Physics params
         ImGui::SeparatorText("Physics");
-        ImGui::SliderFloat("G", &sim_G, 0.01f, 10.0f, "%.2f");
-        ImGui::SliderFloat("Softening", &sim_softening, 0.01f, 5.0f, "%.2f");
+        bool physics_changed = false;
+        physics_changed |= ImGui::SliderFloat("G", &sim_G, 0.01f, 10.0f, "%.2f");
+        physics_changed |= ImGui::SliderFloat("Softening", &sim_softening, 0.01f, 5.0f, "%.2f");
+        if (physics_changed && simulation)
+            simulation->setPhysics(sim_G, sim_softening);
+
         ImGui::SliderFloat("Time Step", &dt, 0.001f, 0.1f, "%.4f");
         ImGui::SliderFloat("Time Scale", &time_scale, 0.1f, 10.0f, "%.1f");
 
-        if (alg_changed || preset_changed || ImGui::Button("Reset")) {
+        if (alg_changed || preset_changed || rebuild_needed || ImGui::Button("Reset")) {
             paused = true;
             createSimulation();
         }
@@ -313,9 +434,31 @@ private:
         if (simulation) {
             ImGui::Text("Particles: %d", simulation->getParticleCount());
             ImGui::Text("Sim Time: %.2f", simulation->getTime());
+            if (current_alg == ALG_FMM_CPU) {
+                if (auto* fmm = dynamic_cast<FMMCPU*>(simulation.get()))
+                    ImGui::Text("Tree: depth %d, %d cells, p = %d",
+                                fmm->depth(), fmm->cellCount(), fmm->order());
+            }
         }
         ImGui::Text("Sim: %.2f ms  Render: %.2f ms", sim_ms, render_ms);
         ImGui::Text("Total: %.2f ms", sim_ms + render_ms);
+
+        if (simulation && simulation->isGPUResident())
+            ImGui::Checkbox("Sync GPU for timing", &sync_gpu_timing);
+
+        // Accuracy
+        ImGui::SeparatorText("Accuracy");
+        if (ImGui::Button("Validate vs Brute Force"))
+            validateAgainstBruteForce();
+        ImGui::SameLine();
+        ImGui::TextDisabled("(O(N) direct sums, may stall)");
+
+        if (err_samples > 0) {
+            ImGui::Text("Rel. accel error over %d samples:", err_samples);
+            ImGui::Text("  max %.3e   rms %.3e", err_max, err_rms);
+        } else if (err_samples == 0 && err_max < 0.0f) {
+            ImGui::TextDisabled("Not measured yet.");
+        }
 
         ImGui::End();
         ImGui::Render();

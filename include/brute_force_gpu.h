@@ -14,6 +14,11 @@ public:
     void reset() override;
     const char* name() const override { return "Brute Force (GPU)"; }
 
+    bool isGPUResident() const override { return true; }
+    GLuint positionBuffer() const override { return pos_ssbo; }
+    GLuint velocityBuffer() const override { return vel_ssbo; }
+    void syncToHost() override;
+
 private:
     std::unique_ptr<Preset> preset;
     float G;
@@ -34,5 +39,4 @@ private:
     void allocateBuffers();
     void freeBuffers();
     void uploadToGPU();
-    void downloadFromGPU();
 };

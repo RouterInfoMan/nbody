@@ -1,0 +1,74 @@
+#version 430 core
+
+// Karras (2012) parallel binary radix tree over Morton-sorted keys.
+//
+// Every internal node is derived independently from the key array, so the
+// whole tree is built in one dispatch with no atomics and no allocator:
+// there are exactly N-1 internal nodes and N leaves, known up front.
+//
+// Node indexing: [0, N-1) internal, [N-1, 2N-1) leaves, leaf k = N-1+k and
+// covers sorted particle k. Root is internal node 0.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KeyBuffer     { uint keys[]; };
+layout(std430, binding = 1) writeonly buffer LeftBuffer   { uint nodeLeft[]; };
+layout(std430, binding = 2) writeonly buffer RightBuffer  { uint nodeRight[]; };
+layout(std430, binding = 3) buffer ParentBuffer           { uint nodeParent[]; };
+
+uniform int particleCount;
+
+int clz(uint x) {
+    // findMSB returns -1 for zero, giving clz(0) == 32 as required.
+    return 31 - findMSB(x);
+}
+
+// Length of the common prefix of keys i and j. Duplicate keys are broken by
+// the indices themselves, which keeps the tree well-formed when many
+// particles land in the same Morton cell.
+int delta(int i, int j) {
+    if (j < 0 || j >= particleCount) return -1;
+    uint ki = keys[i];
+    uint kj = keys[j];
+    if (ki == kj) return 32 + clz(uint(i) ^ uint(j));
+    return clz(ki ^ kj);
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= particleCount - 1) return;
+
+    // Direction in which this node's range extends.
+    int d = (delta(i, i + 1) - delta(i, i - 1)) >= 0 ? 1 : -1;
+    int deltaMin = delta(i, i - d);
+
+    // Exponential search for an upper bound on the range length...
+    int lmax = 2;
+    while (delta(i, i + lmax * d) > deltaMin) lmax <<= 1;
+
+    // ...then binary search for the exact length.
+    int l = 0;
+    for (int t = lmax >> 1; t >= 1; t >>= 1) {
+        if (delta(i, i + (l + t) * d) > deltaMin) l += t;
+    }
+    int j = i + l * d;
+
+    // Binary search for the split position within [i, j].
+    int deltaNode = delta(i, j);
+    int s = 0;
+    int t = l;
+    do {
+        t = (t + 1) >> 1;
+        if (delta(i, i + (s + t) * d) > deltaNode) s += t;
+    } while (t > 1);
+
+    int split = i + s * d + min(d, 0);
+
+    int left  = (min(i, j) == split)     ? (particleCount - 1 + split)       : split;
+    int right = (max(i, j) == split + 1) ? (particleCount - 1 + split + 1)   : (split + 1);
+
+    nodeLeft[i] = uint(left);
+    nodeRight[i] = uint(right);
+    nodeParent[left] = uint(i);
+    nodeParent[right] = uint(i);
+}

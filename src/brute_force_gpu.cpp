@@ -17,6 +17,7 @@ BruteForceGPU::~BruteForceGPU() {
 void BruteForceGPU::reset() {
     current_time = 0.0f;
     preset->apply(particles);
+    setParticleCount(static_cast<int>(particles.size()));
 
     freeBuffers();
     allocateBuffers();
@@ -65,9 +66,6 @@ void BruteForceGPU::step(float dt) {
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    glFinish();
-
-    downloadFromGPU();
     current_time += dt;
 }
 
@@ -112,10 +110,11 @@ void BruteForceGPU::uploadToGPU() {
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(float), masses.data(), GL_DYNAMIC_DRAW);
 }
 
-void BruteForceGPU::downloadFromGPU() {
+void BruteForceGPU::syncToHost() {
     int n = static_cast<int>(particles.size());
+    if (n == 0) return;
 
-    std::vector<glm::vec2> positions(n), velocities(n);
+    std::vector<glm::vec2> positions(n), velocities(n), accelerations(n);
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, pos_ssbo);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n * sizeof(glm::vec2), positions.data());
@@ -123,8 +122,12 @@ void BruteForceGPU::downloadFromGPU() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, vel_ssbo);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n * sizeof(glm::vec2), velocities.data());
 
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, acc_ssbo);
+    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, n * sizeof(glm::vec2), accelerations.data());
+
     for (int i = 0; i < n; i++) {
         particles[i].position = positions[i];
         particles[i].velocity = velocities[i];
+        particles[i].acceleration = accelerations[i];
     }
 }

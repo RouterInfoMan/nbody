@@ -1,0 +1,49 @@
+#version 430 core
+
+// 32-bit 2D Morton codes (16 bits per axis) plus the identity permutation.
+// Bounds come straight from bh_bounds.comp's SSBO, so the host never stalls
+// on a readback to set up the sort.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 1) readonly buffer BoundsBuffer   { uint bounds[]; };
+layout(std430, binding = 2) writeonly buffer KeyBuffer     { uint keys[]; };
+layout(std430, binding = 3) writeonly buffer ValueBuffer   { uint values[]; };
+
+uniform int particleCount;
+
+float keyToFloat(uint k) {
+    return uintBitsToFloat(((k & 0x80000000u) != 0u) ? (k & 0x7FFFFFFFu) : ~k);
+}
+
+// Interleave 16 low bits with zeros.
+uint expandBits(uint v) {
+    v &= 0x0000FFFFu;
+    v = (v | (v << 8)) & 0x00FF00FFu;
+    v = (v | (v << 4)) & 0x0F0F0F0Fu;
+    v = (v | (v << 2)) & 0x33333333u;
+    v = (v | (v << 1)) & 0x55555555u;
+    return v;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(particleCount)) return;
+
+    vec2 lo = vec2(keyToFloat(bounds[0]), keyToFloat(bounds[1]));
+    vec2 hi = vec2(keyToFloat(bounds[2]), keyToFloat(bounds[3]));
+
+    vec2 pad = (hi - lo) * 0.01 + vec2(1e-6);
+    lo -= pad;
+    hi += pad;
+
+    vec2 extent = max(hi - lo, vec2(1e-20));
+    vec2 n = clamp((positions[i] - lo) / extent, 0.0, 0.999999);
+
+    uint x = uint(n.x * 65535.0);
+    uint y = uint(n.y * 65535.0);
+
+    keys[i] = expandBits(x) | (expandBits(y) << 1);
+    values[i] = i;
+}

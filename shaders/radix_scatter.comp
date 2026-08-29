@@ -1,0 +1,117 @@
+#version 430 core
+
+// Pass 3: stable scatter of one 4-bit digit.
+//
+// Each thread owns a contiguous run of 8 items, so ordering by (thread id,
+// item index) is the original input order -- that is what makes this pass
+// stable, which LSD radix sort requires.
+//
+// Destination of an element = (global offset of this block's run of that
+// digit, from the scanned histogram)
+//           + (rank of this thread's items of that digit within the block)
+//           + (how many earlier items this thread holds with that digit).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer KeyInBuffer   { uint keysIn[]; };
+layout(std430, binding = 1) readonly buffer HistBuffer    { uint histScan[]; };
+layout(std430, binding = 2) readonly buffer ValueInBuffer { uint valuesIn[]; };
+layout(std430, binding = 3) writeonly buffer KeyOutBuffer   { uint keysOut[]; };
+layout(std430, binding = 4) writeonly buffer ValueOutBuffer { uint valuesOut[]; };
+
+uniform int particleCount;
+uniform int numBlocks;
+uniform int shiftBits;
+
+const uint ITEMS_PER_THREAD = 8u;
+const uint BLOCK_SIZE = 2048u;
+const uint RADIX = 16u;
+const uint THREADS = 256u;
+
+// Bin-major: s_counts[bin * THREADS + tid]. Only thread `tid` touches its own
+// column, so the accumulation below needs no atomics.
+shared uint s_counts[4096];   // RADIX * THREADS
+shared uint s_partial[256];   // THREADS
+shared uint s_binBase[16];    // RADIX
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint base = block * BLOCK_SIZE + lid * ITEMS_PER_THREAD;
+
+    uint myKeys[8];
+    uint myValues[8];
+    uint myDigits[8];
+    bool valid[8];
+
+    for (uint b = 0u; b < RADIX; b++)
+        s_counts[b * THREADS + lid] = 0u;
+    barrier();
+
+    for (uint i = 0u; i < ITEMS_PER_THREAD; i++) {
+        uint idx = base + i;
+        valid[i] = idx < uint(particleCount);
+        if (valid[i]) {
+            myKeys[i] = keysIn[idx];
+            myValues[i] = valuesIn[idx];
+            myDigits[i] = (myKeys[i] >> uint(shiftBits)) & 15u;
+            s_counts[myDigits[i] * THREADS + lid] += 1u;
+        } else {
+            myKeys[i] = 0u;
+            myValues[i] = 0u;
+            myDigits[i] = 0u;
+        }
+    }
+    barrier();
+
+    // Exclusive scan of the full 4096-entry bin-major table. Each thread
+    // serially folds its own 16 contiguous entries, the 256 partials are
+    // scanned in shared memory, then the result is written back in place.
+    uint sum = 0u;
+    for (uint j = 0u; j < RADIX; j++)
+        sum += s_counts[lid * RADIX + j];
+
+    s_partial[lid] = sum;
+    barrier();
+
+    for (uint off = 1u; off < THREADS; off <<= 1) {
+        uint t = (lid >= off) ? s_partial[lid - off] : 0u;
+        barrier();
+        s_partial[lid] += t;
+        barrier();
+    }
+
+    uint threadOffset = s_partial[lid] - sum;
+    barrier();
+
+    uint run = threadOffset;
+    for (uint j = 0u; j < RADIX; j++) {
+        uint v = s_counts[lid * RADIX + j];
+        s_counts[lid * RADIX + j] = run;
+        run += v;
+    }
+    barrier();
+
+    // s_counts[bin * THREADS + 0] is now the number of block elements in
+    // strictly lower bins, i.e. where this bin's run starts within the block.
+    if (lid < RADIX)
+        s_binBase[lid] = s_counts[lid * THREADS];
+    barrier();
+
+    for (uint i = 0u; i < ITEMS_PER_THREAD; i++) {
+        if (!valid[i]) continue;
+
+        uint d = myDigits[i];
+
+        uint earlier = 0u;
+        for (uint k = 0u; k < i; k++)
+            if (valid[k] && myDigits[k] == d) earlier++;
+
+        uint dst = histScan[d * uint(numBlocks) + block]
+                 + (s_counts[d * THREADS + lid] - s_binBase[d])
+                 + earlier;
+
+        keysOut[dst] = myKeys[i];
+        valuesOut[dst] = myValues[i];
+    }
+}
