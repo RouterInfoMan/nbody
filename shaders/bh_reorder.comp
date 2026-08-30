@@ -15,6 +15,11 @@ layout(std430, binding = 3) readonly buffer IndexBuffer   { uint indices[]; };
 layout(std430, binding = 4) writeonly buffer DstPosBuffer  { vec2 dstPos[]; };
 layout(std430, binding = 5) writeonly buffer DstVelBuffer  { vec2 dstVel[]; };
 layout(std430, binding = 6) writeonly buffer DstMassBuffer { float dstMass[]; };
+// A stable identity per particle. Array position is permuted every step, so
+// anything the renderer derives per particle -- a colour seed, say -- would
+// otherwise change identity each frame and flicker.
+layout(std430, binding = 7) readonly buffer SrcIdBuffer   { uint srcId[]; };
+layout(std430, binding = 8) writeonly buffer DstIdBuffer  { uint dstId[]; };
 
 uniform int particleCount;
 
@@ -26,4 +31,5 @@ void main() {
     dstPos[i] = srcPos[src];
     dstVel[i] = srcVel[src];
     dstMass[i] = srcMass[src];
+    dstId[i] = srcId[src];
 }

@@ -89,6 +89,21 @@ void taylorSoftened(double Rx, double Ry, double eps_sq, int q, std::vector<doub
 
 }  // namespace
 
+void FMMCPU::CellIndex::build(const std::vector<uint32_t>& keys) {
+    size_t cap = 16;
+    while (cap < keys.size() * 2 + 1) cap <<= 1;
+    mask = uint32_t(cap - 1);
+    slot_keys.assign(cap, EMPTY);
+    slot_vals.assign(cap, -1);
+
+    for (size_t i = 0; i < keys.size(); i++) {
+        uint32_t h = hash(keys[i]) & mask;
+        while (slot_keys[h] != EMPTY) h = (h + 1) & mask;
+        slot_keys[h] = keys[i];
+        slot_vals[h] = int(i);
+    }
+}
+
 void FMMCPU::Level::clear() {
     keys.clear();
     body_start.clear();
@@ -126,9 +141,10 @@ void FMMCPU::reset() {
     setParticleCount(static_cast<int>(particles.size()));
 
     const size_t n = particles.size();
-    sorted.resize(n);
+    pos_x.resize(n); pos_y.resize(n); mass.resize(n);
+    acc_x.resize(n); acc_y.resize(n);
     codes.resize(n);
-    scratch_codes.resize(n);
+    sort_keys.resize(n);
     order_map.resize(n);
 
     max_level = autoDepth(static_cast<int>(n), leaf_capacity);
@@ -142,6 +158,17 @@ void FMMCPU::setOrder(int new_p) {
 
 void FMMCPU::setDepth(int d) {
     max_level = std::clamp(d, FIRST_M2L_LEVEL, 12);
+    rebuildTables();
+}
+
+void FMMCPU::setNearFieldRadius(int ws) {
+    near_radius = std::clamp(ws, 1, 2);
+    rebuildTables();
+}
+
+void FMMCPU::setLeafCapacity(int cap) {
+    leaf_capacity = std::max(1, cap);
+    max_level = autoDepth(getParticleCount(), leaf_capacity);
     rebuildTables();
 }
 
@@ -216,25 +243,27 @@ void FMMCPU::sortByMorton() {
     pool.parallel_for(0, n, [&](int start, int end) {
         for (int i = start; i < end; i++) {
             glm::vec2 u = glm::clamp((particles[i].position - base) * inv_side, 0.0f, 0.999999f);
-            codes[i] = mortonEncode(uint32_t(u.x * 65536.0f), uint32_t(u.y * 65536.0f));
-            order_map[i] = i;
+            const uint32_t code = mortonEncode(uint32_t(u.x * 65536.0f), uint32_t(u.y * 65536.0f));
+            sort_keys[i] = CpuRadixSort::pack(code, uint32_t(i));
         }
     });
 
-    std::sort(order_map.begin(), order_map.end(),
-              [this](int a, int b) { return codes[a] < codes[b]; });
+    sorter.sort(sort_keys, n, pool);
 
     pool.parallel_for(0, n, [&](int start, int end) {
         for (int i = start; i < end; i++) {
-            sorted[i] = particles[order_map[i]];
-            scratch_codes[i] = codes[order_map[i]];
+            const int id = int(CpuRadixSort::payload(sort_keys[i]));
+            pos_x[i] = particles[id].position.x;
+            pos_y[i] = particles[id].position.y;
+            mass[i] = particles[id].mass;
+            order_map[i] = id;
+            codes[i] = CpuRadixSort::key(sort_keys[i]);
         }
     });
-    codes.swap(scratch_codes);
 }
 
 void FMMCPU::buildLevels() {
-    const int n = static_cast<int>(sorted.size());
+    const int n = getParticleCount();
 
     for (int l = 0; l <= max_level; l++) {
         Level& lv = levels[l];
@@ -254,6 +283,7 @@ void FMMCPU::buildLevels() {
         lv.parent.assign(lv.size(), -1);
         lv.child_begin.assign(lv.size(), 0);
         lv.child_end.assign(lv.size(), 0);
+        lv.index.build(lv.keys);
     }
 
     // Children of a cell share its key prefix and the key arrays are sorted,
@@ -282,13 +312,6 @@ glm::vec2 FMMCPU::cellCenter(int level, uint32_t key) const {
     return root_min + glm::vec2((float(cx) + 0.5f) * h, (float(cy) + 0.5f) * h);
 }
 
-int FMMCPU::findCell(int level, uint32_t key) const {
-    const std::vector<uint32_t>& keys = levels[level].keys;
-    auto it = std::lower_bound(keys.begin(), keys.end(), key);
-    if (it == keys.end() || *it != key) return -1;
-    return static_cast<int>(it - keys.begin());
-}
-
 void FMMCPU::buildTree() {
     sortByMorton();
     buildLevels();
@@ -314,19 +337,22 @@ void FMMCPU::buildM2LMatrices() {
     const double eps_sq = double(softening) * double(softening);
     const int mat_size = stride * stride;
 
+    const int reach = m2lReach();
+    const int span = m2lSpan();
+
     for (int l = FIRST_M2L_LEVEL; l <= max_level; l++) {
-        m2l_matrices[l].assign(size_t(49) * mat_size, 0.0);
+        m2l_matrices[l].assign(size_t(span) * span * mat_size, 0.0);
         const double h = double(cellSize(l));
 
         std::vector<double> T;
-        for (int dy = -3; dy <= 3; dy++) {
-            for (int dx = -3; dx <= 3; dx++) {
-                if (std::abs(dx) <= 1 && std::abs(dy) <= 1) continue;   // near field
+        for (int dy = -reach; dy <= reach; dy++) {
+            for (int dx = -reach; dx <= reach; dx++) {
+                if (std::abs(dx) <= near_radius && std::abs(dy) <= near_radius) continue;
 
                 // R points from the source centre to the target centre.
                 taylorSoftened(-double(dx) * h, -double(dy) * h, eps_sq, q, T);
 
-                double* mat = &m2l_matrices[l][size_t((dy + 3) * 7 + (dx + 3)) * mat_size];
+                double* mat = &m2l_matrices[l][size_t((dy + reach) * span + (dx + reach)) * mat_size];
                 for (int j = 0; j < stride; j++) {          // beta (target)
                     const int bx = alpha_x[j], by = alpha_y[j];
                     for (int i = 0; i < stride; i++) {      // alpha (source)
@@ -345,16 +371,16 @@ void FMMCPU::cartP2M() {
     std::vector<double>& M = cart_multipole[max_level];
     const int cells = static_cast<int>(leaf.size());
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         double px[MAX_ORDER + 1], py[MAX_ORDER + 1];
         for (int c = start; c < end; c++) {
             const glm::vec2 center = cellCenter(max_level, leaf.keys[c]);
             double* dst = &M[size_t(c) * stride];
 
             for (int b = leaf.body_start[c]; b < leaf.body_end[c]; b++) {
-                const double tx = double(sorted[b].position.x) - double(center.x);
-                const double ty = double(sorted[b].position.y) - double(center.y);
-                const double m = double(sorted[b].mass);
+                const double tx = double(pos_x[b]) - double(center.x);
+                const double ty = double(pos_y[b]) - double(center.y);
+                const double m = double(mass[b]);
 
                 px[0] = py[0] = 1.0;
                 for (int k = 1; k <= p; k++) { px[k] = px[k - 1] * tx; py[k] = py[k - 1] * ty; }
@@ -376,7 +402,7 @@ void FMMCPU::cartM2M(int level) {
     const std::vector<double>& Mc = cart_multipole[level + 1];
     const int cells = static_cast<int>(parent.size());
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         double vx[MAX_ORDER + 1], vy[MAX_ORDER + 1];
         for (int c = start; c < end; c++) {
             const glm::vec2 pc = cellCenter(level, parent.keys[c]);
@@ -415,8 +441,11 @@ void FMMCPU::cartM2L(int level) {
     const int cells = static_cast<int>(lv.size());
     const int mat_size = stride * stride;
     const uint32_t grid = 1u << level;
+    const int ws = near_radius;
+    const int reach = m2lReach();
+    const int span = m2lSpan();
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         for (int c = start; c < end; c++) {
             const uint32_t key = lv.keys[c];
             const int tx = int(compactBits(key));
@@ -427,25 +456,25 @@ void FMMCPU::cartM2L(int level) {
             // that are not themselves neighbours of this cell. Enumerating the
             // integer offsets directly is equivalent and avoids materialising
             // the list.
-            for (int dy = -3; dy <= 3; dy++) {
+            for (int dy = -reach; dy <= reach; dy++) {
                 const int sy = ty + dy;
                 if (sy < 0 || sy >= int(grid)) continue;
 
-                for (int dx = -3; dx <= 3; dx++) {
-                    if (std::abs(dx) <= 1 && std::abs(dy) <= 1) continue;
+                for (int dx = -reach; dx <= reach; dx++) {
+                    if (std::abs(dx) <= ws && std::abs(dy) <= ws) continue;
 
                     const int sx = tx + dx;
                     if (sx < 0 || sx >= int(grid)) continue;
 
                     // Only cells sharing a parent-neighbour are well separated
                     // at this level; the rest are handled one level up.
-                    if (std::abs((sx >> 1) - (tx >> 1)) > 1) continue;
-                    if (std::abs((sy >> 1) - (ty >> 1)) > 1) continue;
+                    if (std::abs((sx >> 1) - (tx >> 1)) > ws) continue;
+                    if (std::abs((sy >> 1) - (ty >> 1)) > ws) continue;
 
                     const int src = findCell(level, mortonEncode(uint32_t(sx), uint32_t(sy)));
                     if (src < 0) continue;
 
-                    const double* mat = &mats[size_t((dy + 3) * 7 + (dx + 3)) * mat_size];
+                    const double* mat = &mats[size_t((dy + reach) * span + (dx + reach)) * mat_size];
                     const double* m = &M[size_t(src) * stride];
 
                     for (int j = 0; j < stride; j++) {
@@ -465,7 +494,7 @@ void FMMCPU::cartL2L(int level) {
     std::vector<double>& Lc = cart_local[level + 1];
     const int cells = static_cast<int>(child.size());
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         double wx[MAX_ORDER + 1], wy[MAX_ORDER + 1];
         for (int c = start; c < end; c++) {
             const int pi = child.parent[c];
@@ -501,15 +530,15 @@ void FMMCPU::cartL2P() {
     const int cells = static_cast<int>(leaf.size());
     const float g = G;
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         double sx_pow[MAX_ORDER + 2], sy_pow[MAX_ORDER + 2];
         for (int c = start; c < end; c++) {
             const glm::vec2 center = cellCenter(max_level, leaf.keys[c]);
             const double* src = &L[size_t(c) * stride];
 
             for (int b = leaf.body_start[c]; b < leaf.body_end[c]; b++) {
-                const double sx = double(sorted[b].position.x) - double(center.x);
-                const double sy = double(sorted[b].position.y) - double(center.y);
+                const double sx = double(pos_x[b]) - double(center.x);
+                const double sy = double(pos_y[b]) - double(center.y);
 
                 sx_pow[0] = sy_pow[0] = 1.0;
                 for (int k = 1; k <= p; k++) {
@@ -526,7 +555,8 @@ void FMMCPU::cartL2P() {
                     if (by > 0) gy += v * double(by) * sx_pow[bx] * sy_pow[by - 1];
                 }
 
-                sorted[b].acceleration = glm::vec2(float(gx) * g, float(gy) * g);
+                acc_x[b] = float(gx) * g;
+                acc_y[b] = float(gy) * g;
             }
         }
     });
@@ -541,15 +571,15 @@ void FMMCPU::cxP2M() {
     std::vector<std::complex<double>>& M = cx_multipole[max_level];
     const int cells = static_cast<int>(leaf.size());
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         for (int c = start; c < end; c++) {
             const glm::vec2 center = cellCenter(max_level, leaf.keys[c]);
             const std::complex<double> zc(center.x, center.y);
             std::complex<double>* dst = &M[size_t(c) * stride];
 
             for (int b = leaf.body_start[c]; b < leaf.body_end[c]; b++) {
-                const std::complex<double> z(sorted[b].position.x, sorted[b].position.y);
-                const double q = double(sorted[b].mass);
+                const std::complex<double> z(pos_x[b], pos_y[b]);
+                const double q = double(mass[b]);
                 const std::complex<double> d = z - zc;
 
                 dst[0] += q;
@@ -570,7 +600,7 @@ void FMMCPU::cxM2M(int level) {
     const std::vector<std::complex<double>>& Mc = cx_multipole[level + 1];
     const int cells = static_cast<int>(parent.size());
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         std::vector<std::complex<double>> dpow(size_t(p) + 1);
         for (int c = start; c < end; c++) {
             const glm::vec2 pc = cellCenter(level, parent.keys[c]);
@@ -605,8 +635,10 @@ void FMMCPU::cxM2L(int level) {
     const int cells = static_cast<int>(lv.size());
     const uint32_t grid = 1u << level;
     const double h = double(cellSize(level));
+    const int ws = near_radius;
+    const int reach = m2lReach();
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         std::vector<std::complex<double>> inv_pow(size_t(p) + 2);
         for (int c = start; c < end; c++) {
             const uint32_t key = lv.keys[c];
@@ -614,17 +646,17 @@ void FMMCPU::cxM2L(int level) {
             const int ty = int(compactBits(key >> 1));
             std::complex<double>* dst = &L[size_t(c) * stride];
 
-            for (int dy = -3; dy <= 3; dy++) {
+            for (int dy = -reach; dy <= reach; dy++) {
                 const int sy = ty + dy;
                 if (sy < 0 || sy >= int(grid)) continue;
 
-                for (int dx = -3; dx <= 3; dx++) {
-                    if (std::abs(dx) <= 1 && std::abs(dy) <= 1) continue;
+                for (int dx = -reach; dx <= reach; dx++) {
+                    if (std::abs(dx) <= ws && std::abs(dy) <= ws) continue;
 
                     const int sx = tx + dx;
                     if (sx < 0 || sx >= int(grid)) continue;
-                    if (std::abs((sx >> 1) - (tx >> 1)) > 1) continue;
-                    if (std::abs((sy >> 1) - (ty >> 1)) > 1) continue;
+                    if (std::abs((sx >> 1) - (tx >> 1)) > ws) continue;
+                    if (std::abs((sy >> 1) - (ty >> 1)) > ws) continue;
 
                     const int src_cell = findCell(level, mortonEncode(uint32_t(sx), uint32_t(sy)));
                     if (src_cell < 0) continue;
@@ -662,7 +694,7 @@ void FMMCPU::cxL2L(int level) {
     std::vector<std::complex<double>>& Lc = cx_local[level + 1];
     const int cells = static_cast<int>(child.size());
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         std::vector<std::complex<double>> dpow(size_t(p) + 1);
         for (int c = start; c < end; c++) {
             const int pi = child.parent[c];
@@ -693,15 +725,14 @@ void FMMCPU::cxL2P() {
     const int cells = static_cast<int>(leaf.size());
     const float g = G;
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         for (int c = start; c < end; c++) {
             const glm::vec2 center = cellCenter(max_level, leaf.keys[c]);
             const std::complex<double> zc(center.x, center.y);
             const std::complex<double>* src = &L[size_t(c) * stride];
 
             for (int b = leaf.body_start[c]; b < leaf.body_end[c]; b++) {
-                const std::complex<double> w =
-                    std::complex<double>(sorted[b].position.x, sorted[b].position.y) - zc;
+                const std::complex<double> w = std::complex<double>(pos_x[b], pos_y[b]) - zc;
 
                 // Phi'(z) = sum_{l>=1} l * b_l * w^(l-1)
                 std::complex<double> deriv(0.0, 0.0);
@@ -713,8 +744,8 @@ void FMMCPU::cxL2P() {
 
                 // phi_real = G * sum m log r, and grad(Re f) = (Re f', -Im f'),
                 // so the attractive acceleration is -G * (Re Phi', -Im Phi').
-                sorted[b].acceleration = glm::vec2(float(-g * deriv.real()),
-                                                   float(g * deriv.imag()));
+                acc_x[b] = float(-g * deriv.real());
+                acc_y[b] = float(g * deriv.imag());
             }
         }
     });
@@ -760,18 +791,19 @@ void FMMCPU::nearFieldPass() {
     const float g = G;
     const float eps_sq = softening * softening;
     const bool log_kernel = (kernel == FMMKernel::Logarithmic);
+    const int ws = near_radius;
 
-    pool.parallel_for(0, cells, [&](int start, int end) {
+    forEachCell(cells, [&](int start, int end) {
         for (int c = start; c < end; c++) {
             const uint32_t key = leaf.keys[c];
             const int tx = int(compactBits(key));
             const int ty = int(compactBits(key >> 1));
 
-            for (int dy = -1; dy <= 1; dy++) {
+            for (int dy = -ws; dy <= ws; dy++) {
                 const int sy = ty + dy;
                 if (sy < 0 || sy >= int(grid)) continue;
 
-                for (int dx = -1; dx <= 1; dx++) {
+                for (int dx = -ws; dx <= ws; dx++) {
                     const int sx = tx + dx;
                     if (sx < 0 || sx >= int(grid)) continue;
 
@@ -782,27 +814,36 @@ void FMMCPU::nearFieldPass() {
 
                     const int js = leaf.body_start[src], je = leaf.body_end[src];
 
+                    const float* sxp = pos_x.data();
+                    const float* syp = pos_y.data();
+                    const float* smp = mass.data();
+
                     for (int i = leaf.body_start[c]; i < leaf.body_end[c]; i++) {
-                        const glm::vec2 pi = sorted[i].position;
-                        glm::vec2 acc(0.0f);
+                        const float pix = pos_x[i], piy = pos_y[i];
+                        float ax = 0.0f, ay = 0.0f;
 
                         if (log_kernel) {
                             for (int j = js; j < je; j++) {
-                                const glm::vec2 d = sorted[j].position - pi;
-                                acc += d * (sorted[j].mass / (glm::dot(d, d) + eps_sq));
+                                const float dx = sxp[j] - pix, dy = syp[j] - piy;
+                                const float w = smp[j] / (dx * dx + dy * dy + eps_sq);
+                                ax += dx * w;
+                                ay += dy * w;
                             }
                         } else {
                             for (int j = js; j < je; j++) {
-                                const glm::vec2 d = sorted[j].position - pi;
-                                const float r2 = glm::dot(d, d) + eps_sq;
+                                const float dx = sxp[j] - pix, dy = syp[j] - piy;
+                                const float r2 = dx * dx + dy * dy + eps_sq;
                                 const float inv = 1.0f / std::sqrt(r2);
-                                acc += d * (sorted[j].mass * inv * inv * inv);
+                                const float w = smp[j] * inv * inv * inv;
+                                ax += dx * w;
+                                ay += dy * w;
                             }
                         }
 
                         // Self-interaction contributes exactly zero (d = 0),
                         // matching brute force, which also does not skip it.
-                        sorted[i].acceleration += acc * g;
+                        acc_x[i] += ax * g;
+                        acc_y[i] += ay * g;
                     }
                 }
             }
@@ -828,7 +869,7 @@ void FMMCPU::step(float dt) {
     const int n = static_cast<int>(particles.size());
     pool.parallel_for(0, n, [&](int start, int end) {
         for (int i = start; i < end; i++)
-            particles[order_map[i]].acceleration = sorted[i].acceleration;
+            particles[order_map[i]].acceleration = glm::vec2(acc_x[i], acc_y[i]);
     });
 
     verletStep2(dt);

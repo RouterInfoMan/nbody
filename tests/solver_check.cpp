@@ -51,23 +51,27 @@ struct Error {
 };
 
 // Direct sum for whichever force law the solver is supposed to reproduce.
+//
+// Accumulated in double even though the solvers work in float. A galaxy's
+// disc contributions largely cancel, so a float reference carries its own
+// summation error of the same order as the tree error being measured, and the
+// two are indistinguishable. Double costs nothing here and makes the reference
+// exact for this purpose.
 glm::vec2 directAccel(const std::vector<Particle>& ps, int i, bool log_kernel) {
-    const float eps_sq = active_softening * active_softening;
-    glm::vec2 acc(0.0f);
-    if (log_kernel) {
-        for (size_t j = 0; j < ps.size(); j++) {
-            glm::vec2 d = ps[j].position - ps[i].position;
-            acc += d * (ps[j].mass / (glm::dot(d, d) + eps_sq));
-        }
-    } else {
-        for (size_t j = 0; j < ps.size(); j++) {
-            glm::vec2 d = ps[j].position - ps[i].position;
-            float r2 = glm::dot(d, d) + eps_sq;
-            float inv = 1.0f / std::sqrt(r2);
-            acc += d * (ps[j].mass * inv * inv * inv);
-        }
+    const double eps_sq = double(active_softening) * double(active_softening);
+    const double xi = ps[i].position.x, yi = ps[i].position.y;
+
+    double ax = 0.0, ay = 0.0;
+    for (size_t j = 0; j < ps.size(); j++) {
+        const double dx = double(ps[j].position.x) - xi;
+        const double dy = double(ps[j].position.y) - yi;
+        const double r2 = dx * dx + dy * dy + eps_sq;
+        const double w = log_kernel ? (double(ps[j].mass) / r2)
+                                    : (double(ps[j].mass) / (r2 * std::sqrt(r2)));
+        ax += dx * w;
+        ay += dy * w;
     }
-    return acc * G;
+    return glm::vec2(float(ax * G), float(ay * G));
 }
 
 Error measure(Simulation& sim, int max_targets, bool log_kernel = false) {
@@ -203,13 +207,21 @@ int main() {
         }
         std::printf("  %-32s PASS\n", path);
     }
-    try {
-        Shader s("shaders/particle.vert", "shaders/particle.frag");
-        (void)s;
-        std::printf("  %-32s PASS\n", "shaders/particle.{vert,frag}");
-    } catch (const std::exception& e) {
-        failures++;
-        std::printf("  %-32s FAIL: %s\n", "shaders/particle.{vert,frag}", e.what());
+    const char* pairs[][2] = {
+        {"shaders/particle.vert",   "shaders/particle.frag"},
+        {"shaders/fullscreen.vert", "shaders/bloom_down.frag"},
+        {"shaders/fullscreen.vert", "shaders/bloom_up.frag"},
+        {"shaders/fullscreen.vert", "shaders/composite.frag"},
+    };
+    for (auto& pr : pairs) {
+        try {
+            Shader s(pr[0], pr[1]);
+            (void)s;
+            std::printf("  %-32s PASS\n", pr[1]);
+        } catch (const std::exception& e) {
+            failures++;
+            std::printf("  %-32s FAIL: %s\n", pr[1], e.what());
+        }
     }
 
     // The GPU-resident draw path binds a solver's own buffers into the
@@ -219,25 +231,151 @@ int main() {
         while (glGetError() != GL_NO_ERROR) {}   // drain
 
         Renderer renderer;
-        renderer.initialize();
+        renderer.initialize(64, 64);
         Camera2D camera(64, 64);
         BarnesHutGPU sim(makePreset(0, 20000), 0.5f, G, SOFTENING);
         sim.step(0.01f);
 
-        for (bool colour : {true, false}) {
-            renderer.setShowVelocity(colour);
-            renderer.renderFromGPU(sim.positionBuffer(), sim.velocityBuffer(),
-                                   sim.getParticleCount(), camera);
+        // Exercise every colouring path and both bloom states.
+        for (int mode = 0; mode < COLOR_MODE_COUNT; mode++) {
+            renderer.setColorMode(mode);
+            for (bool bloom : {true, false}) {
+                renderer.setBloomEnabled(bloom);
+                renderer.renderFromGPU(sim.positionBuffer(), sim.velocityBuffer(),
+                                       sim.massBuffer(), sim.idBuffer(),
+                                       sim.getParticleCount(), camera);
+            }
         }
+        // And the host-side path, which uploads rather than binding solver buffers.
+        BarnesHutCPU cpu(makePreset(0, 5000), 0.9f, G, SOFTENING);
+        cpu.step(0.01f);
+        renderer.render(cpu.getParticles(), camera, true);
         glFinish();
 
         const GLenum err = glGetError();
         if (err != GL_NO_ERROR) {
             failures++;
-            std::printf("  draw from solver buffers        FAIL (GL error 0x%04x)\n", err);
+            std::printf("  HDR draw paths                  FAIL (GL error 0x%04x)\n", err);
         } else {
-            std::printf("  draw from solver buffers        PASS\n");
+            std::printf("  HDR draw paths                  PASS\n");
         }
+    }
+
+    // ---- Presets --------------------------------------------------------
+    std::printf("\nPreset parameters\n");
+    {
+        auto check = [](const char* what, bool ok) {
+            if (!ok) failures++;
+            std::printf("  %-46s %s\n", what, ok ? "PASS" : "FAIL");
+        };
+
+        GalaxyParams g;
+        g.count = 20000;
+        g.inner_radius = 25.0f;
+        g.outer_radius = 90.0f;
+        g.central_mass = 5000.0f;
+        g.particle_mass = 0.25f;
+        g.G = 2.0f;
+
+        std::vector<Particle> p;
+        GalaxyPreset(g).apply(p);
+
+        check("galaxy: count matches getParticleCount()",
+              int(p.size()) == GalaxyPreset(g).getParticleCount());
+        check("galaxy: central mass present", p[0].mass == g.central_mass);
+
+        bool radii_ok = true, mass_ok = true;
+        double lz = 0.0;
+        for (size_t i = 1; i < p.size(); i++) {
+            const float r = glm::length(p[i].position);
+            // A hair of slack for float rounding at the interval ends.
+            if (r < g.inner_radius * 0.999f || r > g.outer_radius * 1.001f) radii_ok = false;
+            if (p[i].mass != g.particle_mass) mass_ok = false;
+            lz += double(p[i].position.x * p[i].velocity.y - p[i].position.y * p[i].velocity.x);
+        }
+        check("galaxy: every particle within [inner, outer]", radii_ok);
+        check("galaxy: particle mass applied", mass_ok);
+        check("galaxy: prograde spin gives positive angular momentum", lz > 0.0);
+
+        // Orbits must be balanced against the G they were built with, and
+        // against the enclosed disc mass, not the central mass alone.
+        {
+            size_t outermost = 1;
+            for (size_t i = 1; i < p.size(); i++)
+                if (glm::length(p[i].position) > glm::length(p[outermost].position)) outermost = i;
+            const float r = glm::length(p[outermost].position);
+            const float v = glm::length(p[outermost].velocity);
+            const float enclosed = g.central_mass + g.particle_mass * float(g.count);
+            const float expect = std::sqrt(g.G * enclosed / r);
+            check("galaxy: outer speed balances G and enclosed disc mass",
+                  std::abs(v - expect) < expect * 0.15f);
+        }
+
+        GalaxyParams g2 = g;
+        g2.spin = -1.0f;
+        std::vector<Particle> p2;
+        GalaxyPreset(g2).apply(p2);
+        double lz2 = 0.0;
+        for (size_t i = 1; i < p2.size(); i++)
+            lz2 += double(p2[i].position.x * p2[i].velocity.y - p2[i].position.y * p2[i].velocity.x);
+        check("galaxy: retrograde spin flips angular momentum", lz2 < 0.0);
+
+        GalaxyParams g3 = g;
+        g3.seed = 777;
+        std::vector<Particle> p3;
+        GalaxyPreset(g3).apply(p3);
+        bool differs = false;
+        for (size_t i = 1; i < p.size() && !differs; i++)
+            if (p[i].position != p3[i].position) differs = true;
+        check("galaxy: a different seed gives a different realisation", differs);
+
+        std::vector<Particle> p4;
+        GalaxyPreset(g).apply(p4);
+        bool identical = p4.size() == p.size();
+        for (size_t i = 0; i < p.size() && identical; i++)
+            if (p4[i].position != p[i].position) identical = false;
+        check("galaxy: the same seed reproduces exactly", identical);
+
+        // Falloff must actually redistribute mass inward.
+        auto medianRadius = [](float falloff) {
+            GalaxyParams gp;
+            gp.count = 20000;
+            gp.inner_radius = 25.0f;
+            gp.outer_radius = 90.0f;
+            gp.density_falloff = falloff;
+            std::vector<Particle> v;
+            GalaxyPreset(gp).apply(v);
+            std::vector<float> radii;
+            for (size_t i = 1; i < v.size(); i++) radii.push_back(glm::length(v[i].position));
+            std::sort(radii.begin(), radii.end());
+            return radii[radii.size() / 2];
+        };
+        check("galaxy: higher falloff concentrates mass inward",
+              medianRadius(2.0f) < medianRadius(0.0f));
+
+        CollapseParams c;
+        c.count = 20000;
+        c.radius = 40.0f;
+        c.particle_mass = 2.0f;
+        c.rotation = 0.0f;
+
+        std::vector<Particle> q;
+        CollapsePreset(c).apply(q);
+        bool cold = true, inside = true;
+        for (const Particle& part : q) {
+            if (glm::length(part.velocity) != 0.0f) cold = false;
+            if (glm::length(part.position) > c.radius * 1.001f) inside = false;
+        }
+        check("collapse: rotation 0 starts at rest", cold);
+        check("collapse: every particle within radius", inside);
+
+        c.rotation = 1.0f;
+        std::vector<Particle> q2;
+        CollapsePreset(c).apply(q2);
+        double lz3 = 0.0;
+        for (const Particle& part : q2)
+            lz3 += double(part.position.x * part.velocity.y - part.position.y * part.velocity.x);
+        check("collapse: rotation adds net angular momentum", lz3 > 0.0);
     }
 
     std::printf("\nGPU radix sort\n");
@@ -256,17 +394,55 @@ int main() {
             // to within float rounding.
             report("brute force CPU (self-check)", measure(ref, 512), 1e-5);
         }
-        {
-            BarnesHutCPU bh(makePreset(which, n), 0.5f, G, SOFTENING);
-            bh.step(0.01f);
-            report("Barnes-Hut CPU, theta 0.5", measure(bh, 512), 2e-2);
+        // Galaxy carries a 10000-mass black hole that dominates every
+        // particle's acceleration and, sitting alone in its own leaf, is
+        // summed exactly. That flatters relative error by roughly 20x.
+        // Collapse -- uniform, equal masses, no dominant term -- is the
+        // honest test of tree accuracy, so its ceilings are scaled to match.
+        const double tol_scale = (which == 0) ? 1.0 : 20.0;
+
+        double bh_err[2][2][2] = {};   // [gpu][quad][theta index]
+        const float thetas[2] = { 0.5f, 0.9f };
+
+        for (int gpu = 0; gpu < 2; gpu++) {
+            for (int quad = 0; quad < 2; quad++) {
+                for (int ti = 0; ti < 2; ti++) {
+                    const float theta = thetas[ti];
+                    std::unique_ptr<Simulation> sim;
+                    if (gpu) {
+                        auto b = std::make_unique<BarnesHutGPU>(makePreset(which, n), theta, G, SOFTENING);
+                        b->setQuadrupole(quad != 0);
+                        sim = std::move(b);
+                    } else {
+                        auto b = std::make_unique<BarnesHutCPU>(makePreset(which, n), theta, G, SOFTENING);
+                        b->setQuadrupole(quad != 0);
+                        sim = std::move(b);
+                    }
+                    sim->step(0.01f);
+
+                    char label[80];
+                    std::snprintf(label, sizeof(label), "Barnes-Hut %s theta %.1f %s",
+                                  gpu ? "GPU" : "CPU", theta, quad ? "mono+quad" : "mono");
+                    const double base = quad ? (theta > 0.7f ? 5e-3 : 5e-4)
+                                             : (theta > 0.7f ? 3e-2 : 5e-3);
+                    const Error e = measure(*sim, 512);
+                    report(label, e, base * tol_scale);
+                    bh_err[gpu][quad][ti] = e.rms_norm;
+                }
+            }
         }
-        for (float theta : {0.5f, 0.2f}) {
-            BarnesHutGPU bh(makePreset(which, n), theta, G, SOFTENING);
-            bh.step(0.01f);
-            char label[64];
-            std::snprintf(label, sizeof(label), "Barnes-Hut GPU, theta %.1f", theta);
-            report(label, measure(bh, 512), theta > 0.3f ? 2e-2 : 5e-3);
+
+        // The invariant that matters and does not depend on the preset:
+        // carrying second moments must buy real accuracy at equal theta.
+        for (int gpu = 0; gpu < 2; gpu++) {
+            for (int ti = 0; ti < 2; ti++) {
+                const double ratio = bh_err[gpu][1][ti] / std::max(bh_err[gpu][0][ti], 1e-30);
+                const bool ok = ratio < 0.5;
+                if (!ok) failures++;
+                std::printf("  quadrupole gain, %s theta %.1f: %.1fx   %s\n",
+                            gpu ? "GPU" : "CPU", thetas[ti], 1.0 / ratio,
+                            ok ? "PASS" : "FAIL");
+            }
         }
 
         // A Cartesian Taylor FMM with one-cell separation converges at roughly
@@ -274,23 +450,30 @@ int main() {
         // The ceilings below allow for that; the more telling check is the
         // monotone decrease, since a missing or double-counted interaction
         // list would make the error plateau no matter how high p goes.
-        double prev = 1e9;
-        bool monotone = true;
-        for (int p = 1; p <= 6; p++) {
-            FMMCPU fmm(makePreset(which, n), FMMKernel::Softened, p, 32, G, SOFTENING);
-            fmm.step(0.01f);
-            char label[64];
-            std::snprintf(label, sizeof(label), "FMM softened 1/r^2, p = %d", p);
-            const Error e = measure(fmm, 512);
-            report(label, e, 2.0 * std::pow(0.45, p));
-            if (p > 1 && e.rms_norm > prev * 0.75) monotone = false;
-            prev = e.rms_norm;
-        }
-        if (!monotone) {
-            failures++;
-            std::printf("  FMM error did not fall steadily with p -- FAIL\n");
-        } else {
-            std::printf("  FMM converges monotonically in p -- PASS\n");
+        for (int ws = 1; ws <= 2; ws++) {
+            std::printf("  -- near-field radius %d\n", ws);
+            double prev = 1e9;
+            bool monotone = true;
+            for (int p = 1; p <= 6; p++) {
+                FMMCPU fmm(makePreset(which, n), FMMKernel::Softened, p, 32, G, SOFTENING);
+                fmm.setNearFieldRadius(ws);
+                fmm.step(0.01f);
+                char label[64];
+                std::snprintf(label, sizeof(label), "FMM softened 1/r^2, p = %d", p);
+                const Error e = measure(fmm, 512);
+                // Convergence ratio per order is ~0.42 at ws=1 and ~0.28 at
+                // ws=2, measured on an isolated M2L; these are loose ceilings.
+                report(label, e, 2.0 * std::pow(ws == 1 ? 0.45 : 0.32, p));
+                (void)tol_scale;
+                if (p > 1 && e.rms_norm > prev * 0.75) monotone = false;
+                prev = e.rms_norm;
+            }
+            if (!monotone) {
+                failures++;
+                std::printf("  FMM error did not fall steadily with p -- FAIL\n");
+            } else {
+                std::printf("  FMM converges monotonically in p -- PASS\n");
+            }
         }
 
         // The logarithmic kernel is a different force law, so it is checked
@@ -340,26 +523,56 @@ int main() {
         return samples[samples.size() / 2];
     };
 
-    std::printf("  %-30s %10s %10s %10s\n", "solver", "N=50k", "N=200k", "N=1M");
-    for (int solver = 0; solver < 5; solver++) {
-        const char* names[] = { "brute force GPU", "Barnes-Hut CPU (theta 0.5)",
-                                "Barnes-Hut GPU (theta 0.5)", "FMM CPU 1/r^2 (p=4)",
-                                "FMM CPU log (p=8)" };
+    const char* names[] = {
+        "brute force GPU (exact)",
+        "Barnes-Hut CPU mono th 0.5",
+        "Barnes-Hut CPU quad th 0.9",
+        "Barnes-Hut GPU mono th 0.5",
+        "Barnes-Hut GPU quad th 0.9",
+        "FMM CPU 1/r^2 p=4 ws=2",
+        "FMM CPU log p=8 ws=2",
+    };
+    auto build = [](int solver, int n) -> std::unique_ptr<Simulation> {
+        switch (solver) {
+            case 0: return std::make_unique<BruteForceGPU>(makePreset(0, n), G, SOFTENING);
+            case 1: { auto b = std::make_unique<BarnesHutCPU>(makePreset(0, n), 0.5f, G, SOFTENING);
+                      b->setQuadrupole(false); return b; }
+            case 2: { auto b = std::make_unique<BarnesHutCPU>(makePreset(0, n), 0.9f, G, SOFTENING);
+                      b->setQuadrupole(true); return b; }
+            case 3: { auto b = std::make_unique<BarnesHutGPU>(makePreset(0, n), 0.5f, G, SOFTENING);
+                      b->setQuadrupole(false); return b; }
+            case 4: { auto b = std::make_unique<BarnesHutGPU>(makePreset(0, n), 0.9f, G, SOFTENING);
+                      b->setQuadrupole(true); return b; }
+            case 5: { auto f = std::make_unique<FMMCPU>(makePreset(0, n), FMMKernel::Softened, 4, 32, G, SOFTENING);
+                      f->setNearFieldRadius(2); return f; }
+            default: { auto f = std::make_unique<FMMCPU>(makePreset(0, n), FMMKernel::Logarithmic, 8, 32, G, SOFTENING);
+                       f->setNearFieldRadius(2); return f; }
+        }
+    };
+
+    std::printf("  %-30s %11s %9s %9s %9s\n", "solver", "err@20k", "N=50k", "N=200k", "N=1M");
+    for (int solver = 0; solver < 7; solver++) {
         std::printf("  %-30s", names[solver]);
+
+        {
+            std::unique_ptr<Simulation> acc = build(solver, 20000);
+            acc->step(0.01f);
+            const double e = measure(*acc, 512, solver == 6).rms_norm;
+            // Brute force is exact by construction; anything above the float
+            // summation floor means a defect, not an approximation.
+            if (solver == 0 && e > 1e-4) {
+                failures++;
+                std::printf("  <- brute force GPU exceeds the float floor, FAIL");
+            }
+            std::printf(" %11.2e", e);
+            std::fflush(stdout);
+        }
 
         for (int n : {50000, 200000, 1000000}) {
             // Brute force at a million particles is 10^12 interactions a step.
-            if (solver == 0 && n > 200000) { std::printf(" %10s", "skipped"); continue; }
-
-            std::unique_ptr<Simulation> sim;
-            switch (solver) {
-                case 0: sim = std::make_unique<BruteForceGPU>(makePreset(0, n), G, SOFTENING); break;
-                case 1: sim = std::make_unique<BarnesHutCPU>(makePreset(0, n), 0.5f, G, SOFTENING); break;
-                case 2: sim = std::make_unique<BarnesHutGPU>(makePreset(0, n), 0.5f, G, SOFTENING); break;
-                case 3: sim = std::make_unique<FMMCPU>(makePreset(0, n), FMMKernel::Softened, 4, 32, G, SOFTENING); break;
-                case 4: sim = std::make_unique<FMMCPU>(makePreset(0, n), FMMKernel::Logarithmic, 8, 32, G, SOFTENING); break;
-            }
-            std::printf(" %10.2f", time_solver(*sim, 5));
+            if (solver == 0 && n > 200000) { std::printf(" %9s", "skipped"); continue; }
+            std::unique_ptr<Simulation> sim = build(solver, n);
+            std::printf(" %9.2f", time_solver(*sim, 5));
             std::fflush(stdout);
         }
         std::printf("\n");

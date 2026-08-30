@@ -27,10 +27,14 @@ public:
     bool isGPUResident() const override { return true; }
     GLuint positionBuffer() const override { return pos_ssbo[cur]; }
     GLuint velocityBuffer() const override { return vel_ssbo[cur]; }
+    GLuint massBuffer() const override { return mass_ssbo[cur]; }
+    GLuint idBuffer() const override { return id_ssbo[cur]; }
     void syncToHost() override;
 
     void setPhysics(float g, float soft) override { G = g; softening = soft; }
     void setTheta(float t) override { theta = t; }
+    void setQuadrupole(bool on) { use_quadrupole = on; }
+    bool quadrupole() const { return use_quadrupole; }
 
 private:
     std::unique_ptr<Preset> preset;
@@ -38,6 +42,7 @@ private:
     float theta;
     float G;
     float softening;
+    bool use_quadrupole = true;
 
     std::unique_ptr<Shader> bounds_shader;
     std::unique_ptr<Shader> morton_shader;
@@ -55,6 +60,7 @@ private:
     GLuint pos_ssbo[2] = {0, 0};
     GLuint vel_ssbo[2] = {0, 0};
     GLuint mass_ssbo[2] = {0, 0};
+    GLuint id_ssbo[2] = {0, 0};
     int cur = 0;
 
     GLuint acc_ssbo = 0;
@@ -69,6 +75,7 @@ private:
     GLuint node_com_ssbo = 0;
     GLuint node_aabb_ssbo = 0;
     GLuint node_flags_ssbo = 0;
+    GLuint node_quad_ssbo = 0;
 
     static constexpr int WORKGROUP_SIZE = 256;
     static constexpr GLuint NO_PARENT = 0xFFFFFFFFu;

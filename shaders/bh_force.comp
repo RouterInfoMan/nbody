@@ -22,13 +22,42 @@ layout(std430, binding = 2) readonly buffer AabbBuffer     { vec4 nodeAabb[]; };
 layout(std430, binding = 3) readonly buffer LeftBuffer     { uint nodeLeft[]; };
 layout(std430, binding = 4) readonly buffer RightBuffer    { uint nodeRight[]; };
 layout(std430, binding = 5) writeonly buffer AccelBuffer   { vec2 accelerations[]; };
+layout(std430, binding = 6) readonly buffer QuadBuffer     { vec4 nodeQuad[]; };
 
 uniform int particleCount;
-uniform float thetaSq;
+uniform float invTheta;
 uniform float softeningSq;
 uniform float G;
+uniform int useQuadrupole;
 
 const int STACK_SIZE = 64;
+
+// Multipole field of a node at offset d = com - x, to second order.
+//
+//   a = M d u^-3/2  - 3 (Qd) u^-5/2  - (3/2) tr(Q) d u^-5/2
+//                   + (15/2) d (d.Qd) u^-7/2 ,     u = |d|^2 + eps^2
+//
+// The quadrupole term turns the truncation error from O(theta^2) into
+// O(theta^3), which pays for itself many times over: the same accuracy is
+// reached at a far wider opening angle, so the traversal visits fewer nodes.
+vec2 multipole(vec2 d, float distSq, vec4 com, vec4 quad, bool withQuad) {
+    float invDist = inversesqrt(max(distSq + softeningSq, 1e-20));
+    float inv2 = invDist * invDist;
+    float inv3 = inv2 * invDist;
+
+    vec2 acc = d * (com.z * inv3);
+
+    if (withQuad) {
+        vec2 qd = vec2(quad.x * d.x + quad.y * d.y,
+                       quad.y * d.x + quad.z * d.y);
+        float dqd = dot(d, qd);
+        float trq = quad.x + quad.z;
+        float inv5 = inv3 * inv2;
+        float inv7 = inv5 * inv2;
+        acc += qd * (-3.0 * inv5) + d * (-1.5 * trq * inv5 + 7.5 * dqd * inv7);
+    }
+    return acc;
+}
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -38,6 +67,8 @@ void main() {
     vec2 acc = vec2(0.0);
 
     int internalCount = particleCount - 1;
+
+    bool withQuad = useQuadrupole != 0;
 
     int stack[STACK_SIZE];
     int sp = 0;
@@ -52,18 +83,26 @@ void main() {
 
         bool isLeaf = node >= internalCount;
 
+        vec4 q = isLeaf ? vec4(0.0) : nodeQuad[node];
+
         bool accept = isLeaf;
         if (!isLeaf) {
             vec4 bb = nodeAabb[node];
             vec2 ext = bb.zw - bb.xy;
+            // Accept when d > size/theta + |com - box centre|. Distance is
+            // measured to the centre of mass but extent from the box, so
+            // without the offset term a source particle can sit almost as far
+            // from the com as the target does and the expansion diverges.
+            float limit = length(ext) * invTheta + q.w;
             // Falling back to the multipole on stack exhaustion keeps total
             // mass exact; dropping the node instead would lose it.
-            accept = (dot(ext, ext) < distSq * thetaSq) || (sp + 2 > STACK_SIZE);
+            accept = (limit * limit < distSq) || (sp + 2 > STACK_SIZE);
         }
 
         if (accept) {
-            float invDist = inversesqrt(max(distSq + softeningSq, 1e-20));
-            acc += d * (c.z * invDist * invDist * invDist);
+            // A leaf is a single particle, so it carries no moment and the
+            // quadrupole branch is skipped for it.
+            acc += multipole(d, distSq, c, q, withQuad && !isLeaf);
         } else {
             stack[sp++] = int(nodeLeft[node]);
             stack[sp++] = int(nodeRight[node]);

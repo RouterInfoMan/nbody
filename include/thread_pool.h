@@ -42,10 +42,17 @@ public:
 
     int size() const { return static_cast<int>(workers.size()); }
 
-    void parallel_for(int begin, int end, const std::function<void(int, int)>& fn) {
+    // `grain` is the minimum number of items worth handing to a worker. Loops
+    // that cannot fill that many per thread run inline instead, which matters
+    // for FMM: it issues dozens of parallel_for calls per step and the coarse
+    // levels have only a handful of cells each, where dispatch costs more than
+    // the work.
+    void parallel_for(int begin, int end, const std::function<void(int, int)>& fn,
+                      int grain = 1) {
         int n = end - begin;
         int num = size();
         if (n <= 0) return;
+        if (grain > 1) num = std::min(num, std::max(1, n / grain));
         if (num <= 1 || n < num) {
             fn(begin, end);
             return;

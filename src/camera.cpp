@@ -22,9 +22,15 @@ void Camera2D::setScreenSize(float width, float height) {
     updateViewSize();
 }
 
+void Camera2D::setHomeRadius(float radius, bool recenter) {
+    home_radius = glm::max(radius, 1e-3f);
+    if (recenter) reset();
+}
+
 void Camera2D::reset() {
     position = glm::vec2(0.0f);
-    zoom_level = 1.0f;
+    // view_height is 100 / zoom, and the framed diameter gets a little margin.
+    zoom_level = glm::clamp(100.0f / (2.0f * home_radius * 1.15f), 0.001f, 100.0f);
     updateViewSize();
 }
 

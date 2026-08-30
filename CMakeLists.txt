@@ -89,8 +89,39 @@ add_executable(solver_check
 target_include_directories(solver_check PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(solver_check PRIVATE OpenGL::GL glfw GLEW::GLEW glm::glm)
 
-# Copy shaders to build directory
-file(COPY ${CMAKE_SOURCE_DIR}/shaders DESTINATION ${CMAKE_BINARY_DIR})
+# Accuracy-vs-cost sweeps used to choose solver defaults.
+add_executable(sweep
+    tests/sweep.cpp
+    src/shader.cpp
+    src/camera.cpp
+    src/renderer.cpp
+    src/brute_force_cpu.cpp
+    src/brute_force_gpu.cpp
+    src/barnes_hut_cpu.cpp
+    src/barnes_hut_gpu.cpp
+    src/gpu_radix_sort.cpp
+    src/fmm_cpu.cpp
+    src/galaxy_preset.cpp
+    src/collapse_preset.cpp
+)
+
+target_include_directories(sweep PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(sweep PRIVATE OpenGL::GL glfw GLEW::GLEW glm::glm)
+
+# Copy shaders to the build directory on every build.
+#
+# This deliberately does NOT use file(COPY), which runs at configure time
+# only: editing a shader and re-running `make` would then silently keep
+# running the stale copy, and a renamed uniform shows up as a shader quietly
+# reading zero rather than as an error.
+add_custom_target(copy_shaders ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/shaders ${CMAKE_BINARY_DIR}/shaders
+    COMMENT "Syncing shaders to build directory"
+)
+add_dependencies(nbody copy_shaders)
+add_dependencies(solver_check copy_shaders)
+add_dependencies(sweep copy_shaders)
 
 # Print config
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")

@@ -19,6 +19,10 @@ public:
     virtual bool isGPUResident() const { return false; }
     virtual GLuint positionBuffer() const { return 0; }
     virtual GLuint velocityBuffer() const { return 0; }
+    virtual GLuint massBuffer() const { return 0; }
+    // Stable per-particle identity, for solvers that permute their state.
+    // Zero means array position is already stable and can be used directly.
+    virtual GLuint idBuffer() const { return 0; }
 
     // Pull device state back into `particles`. On CPU solvers this is a no-op;
     // on GPU solvers it stalls the pipeline, so only call it when the host

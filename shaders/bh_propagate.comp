@@ -18,6 +18,9 @@ layout(std430, binding = 4) readonly buffer ParentBuffer   { uint nodeParent[]; 
 layout(std430, binding = 5) coherent buffer ComBuffer      { vec4 nodeCom[]; };
 layout(std430, binding = 6) coherent buffer AabbBuffer     { vec4 nodeAabb[]; };
 layout(std430, binding = 7) coherent buffer FlagBuffer     { uint nodeFlags[]; };
+// xyz = (Qxx, Qxy, Qyy), the second mass moment about the node's centre of
+// mass. A leaf holds one particle, so its moment is exactly zero.
+layout(std430, binding = 8) coherent buffer QuadBuffer     { vec4 nodeQuad[]; };
 
 uniform int particleCount;
 
@@ -31,6 +34,7 @@ void main() {
 
     nodeCom[leaf] = vec4(p, m, 0.0);
     nodeAabb[leaf] = vec4(p, p);
+    nodeQuad[leaf] = vec4(0.0);
 
     memoryBarrierBuffer();
 
@@ -53,6 +57,19 @@ void main() {
         vec4 al = nodeAabb[l];
         vec4 ar = nodeAabb[r];
         nodeAabb[node] = vec4(min(al.xy, ar.xy), max(al.zw, ar.zw));
+
+        // Parallel axis theorem: each child's moment shifted to the parent's
+        // centre of mass.
+        vec2 sl = cl.xy - com;
+        vec2 sr = cr.xy - com;
+        vec3 ql = nodeQuad[l].xyz + cl.z * vec3(sl.x * sl.x, sl.x * sl.y, sl.y * sl.y);
+        vec3 qr = nodeQuad[r].xyz + cr.z * vec3(sr.x * sr.x, sr.x * sr.y, sr.y * sr.y);
+
+        // w carries the distance from the box centre to the centre of mass,
+        // which the opening test needs; the slot was otherwise padding.
+        vec4 bb = nodeAabb[node];
+        float offset = length(com - 0.5 * (bb.xy + bb.zw));
+        nodeQuad[node] = vec4(ql + qr, offset);
 
         memoryBarrierBuffer();
         node = nodeParent[node];

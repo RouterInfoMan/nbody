@@ -120,6 +120,8 @@ void BarnesHutGPU::buildTreeAndComputeForces() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, pos_ssbo[1 - cur]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, vel_ssbo[1 - cur]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, mass_ssbo[1 - cur]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, id_ssbo[cur]);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, id_ssbo[1 - cur]);
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     cur = 1 - cur;
@@ -151,21 +153,24 @@ void BarnesHutGPU::buildTreeAndComputeForces() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, node_com_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, node_aabb_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, node_flags_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, node_quad_ssbo);
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
     // --- Traversal ----------------------------------------------------
     force_shader->use();
     force_shader->set_int("particleCount", n);
-    force_shader->set_float("thetaSq", theta * theta);
+    force_shader->set_float("invTheta", 1.0f / theta);
     force_shader->set_float("softeningSq", softening * softening);
     force_shader->set_float("G", G);
+    force_shader->set_int("useQuadrupole", use_quadrupole ? 1 : 0);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, pos_ssbo[cur]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, node_com_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, node_aabb_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, node_left_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, node_right_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, acc_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, node_quad_ssbo);
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
@@ -183,11 +188,11 @@ void BarnesHutGPU::allocateBuffers() {
 
     GLuint* handles[] = {
         &pos_ssbo[0], &pos_ssbo[1], &vel_ssbo[0], &vel_ssbo[1],
-        &mass_ssbo[0], &mass_ssbo[1], &acc_ssbo,
+        &mass_ssbo[0], &mass_ssbo[1], &id_ssbo[0], &id_ssbo[1], &acc_ssbo,
         &key_ssbo[0], &key_ssbo[1], &val_ssbo[0], &val_ssbo[1],
         &bounds_ssbo,
         &node_left_ssbo, &node_right_ssbo, &node_parent_ssbo,
-        &node_com_ssbo, &node_aabb_ssbo, &node_flags_ssbo,
+        &node_com_ssbo, &node_aabb_ssbo, &node_flags_ssbo, &node_quad_ssbo,
     };
     for (GLuint* h : handles) glGenBuffers(1, h);
 
@@ -195,6 +200,7 @@ void BarnesHutGPU::allocateBuffers() {
         allocBuffer(pos_ssbo[i], vec2_bytes);
         allocBuffer(vel_ssbo[i], vec2_bytes);
         allocBuffer(mass_ssbo[i], float_bytes);
+        allocBuffer(id_ssbo[i], uint_bytes);
         allocBuffer(key_ssbo[i], uint_bytes);
         allocBuffer(val_ssbo[i], uint_bytes);
     }
@@ -209,6 +215,7 @@ void BarnesHutGPU::allocateBuffers() {
     allocBuffer(node_parent_ssbo, GLsizeiptr(total_nodes) * sizeof(GLuint));
     allocBuffer(node_com_ssbo, GLsizeiptr(total_nodes) * sizeof(glm::vec4));
     allocBuffer(node_aabb_ssbo, GLsizeiptr(total_nodes) * sizeof(glm::vec4));
+    allocBuffer(node_quad_ssbo, GLsizeiptr(total_nodes) * sizeof(glm::vec4));
 
     cur = 0;
 }
@@ -216,11 +223,11 @@ void BarnesHutGPU::allocateBuffers() {
 void BarnesHutGPU::freeBuffers() {
     GLuint* handles[] = {
         &pos_ssbo[0], &pos_ssbo[1], &vel_ssbo[0], &vel_ssbo[1],
-        &mass_ssbo[0], &mass_ssbo[1], &acc_ssbo,
+        &mass_ssbo[0], &mass_ssbo[1], &id_ssbo[0], &id_ssbo[1], &acc_ssbo,
         &key_ssbo[0], &key_ssbo[1], &val_ssbo[0], &val_ssbo[1],
         &bounds_ssbo,
         &node_left_ssbo, &node_right_ssbo, &node_parent_ssbo,
-        &node_com_ssbo, &node_aabb_ssbo, &node_flags_ssbo,
+        &node_com_ssbo, &node_aabb_ssbo, &node_flags_ssbo, &node_quad_ssbo,
     };
     for (GLuint* h : handles) {
         if (*h) { glDeleteBuffers(1, h); *h = 0; }
@@ -233,11 +240,13 @@ void BarnesHutGPU::uploadToGPU() {
 
     std::vector<glm::vec2> positions(n), velocities(n), zeros(n, glm::vec2(0.0f));
     std::vector<float> masses(n);
+    std::vector<GLuint> ids(n);
 
     for (int i = 0; i < n; i++) {
         positions[i] = particles[i].position;
         velocities[i] = particles[i].velocity;
         masses[i] = particles[i].mass;
+        ids[i] = GLuint(i);
     }
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, pos_ssbo[0]);
@@ -246,6 +255,8 @@ void BarnesHutGPU::uploadToGPU() {
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(n) * sizeof(glm::vec2), velocities.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, mass_ssbo[0]);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(n) * sizeof(float), masses.data());
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, id_ssbo[0]);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(n) * sizeof(GLuint), ids.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, acc_ssbo);
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(n) * sizeof(glm::vec2), zeros.data());
 

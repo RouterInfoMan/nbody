@@ -17,6 +17,7 @@ public:
     bool isGPUResident() const override { return true; }
     GLuint positionBuffer() const override { return pos_ssbo; }
     GLuint velocityBuffer() const override { return vel_ssbo; }
+    GLuint massBuffer() const override { return mass_ssbo; }
     void syncToHost() override;
 
 private:

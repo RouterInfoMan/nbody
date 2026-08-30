@@ -2,7 +2,9 @@
 #include "simulation.h"
 #include "preset.h"
 #include "thread_pool.h"
+#include "cpu_radix_sort.h"
 #include <complex>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -44,9 +46,18 @@ public:
     void setKernel(FMMKernel k) { kernel = k; rebuildTables(); }
     void setOrder(int p);
     void setDepth(int d);
+    // Cells within this many cells of a target are handled by direct
+    // summation. Raising it to 2 pushes the nearest translated pair from a
+    // 2-cell to a 3-cell separation, improving the expansion ratio from ~0.71
+    // to ~0.47 at the cost of a 25-cell near field and a 75-entry
+    // interaction list.
+    void setNearFieldRadius(int ws);
+    void setLeafCapacity(int cap);
 
     int depth() const { return max_level; }
     int order() const { return p; }
+    int nearFieldRadius() const { return near_radius; }
+    int leafCapacity() const { return leaf_capacity; }
     int cellCount() const;
     FMMKernel kernelMode() const { return kernel; }
 
@@ -60,6 +71,36 @@ private:
     // is a neighbour of every other, so there is nothing to translate.
     static constexpr int FIRST_M2L_LEVEL = 2;
 
+    // Open-addressed key -> cell index map. The interaction lists do tens of
+    // lookups per cell per level, which is far too hot for a binary search
+    // over the level's key array.
+    struct CellIndex {
+        static constexpr uint32_t EMPTY = 0xFFFFFFFFu;
+
+        std::vector<uint32_t> slot_keys;
+        std::vector<int> slot_vals;
+        uint32_t mask = 0;
+
+        static uint32_t hash(uint32_t k) {
+            k *= 0x9E3779B1u;
+            k ^= k >> 15;
+            k *= 0x85EBCA6Bu;
+            k ^= k >> 13;
+            return k;
+        }
+
+        void build(const std::vector<uint32_t>& keys);
+        int find(uint32_t key) const {
+            uint32_t h = hash(key) & mask;
+            for (;;) {
+                const uint32_t k = slot_keys[h];
+                if (k == key) return slot_vals[h];
+                if (k == EMPTY) return -1;
+                h = (h + 1) & mask;
+            }
+        }
+    };
+
     struct Level {
         std::vector<uint32_t> keys;      // ascending, one per non-empty cell
         std::vector<int> body_start;     // range into `sorted`
@@ -67,6 +108,7 @@ private:
         std::vector<int> parent;         // index into level l-1
         std::vector<int> child_begin;    // range into level l+1
         std::vector<int> child_end;
+        CellIndex index;
 
         size_t size() const { return keys.size(); }
         void clear();
@@ -74,20 +116,26 @@ private:
 
     std::unique_ptr<Preset> preset;
     ThreadPool pool;
+    CpuRadixSort sorter;
 
     FMMKernel kernel;
     int p;                  // expansion order
     int leaf_capacity;
     int max_level;
+    int near_radius = 1;    // cells within this distance are summed directly
     float G;
     float softening;
 
-    // Morton-sorted working copy of the particles; accelerations are computed
-    // here and scattered back through `order_map`.
-    std::vector<Particle> sorted;
+    // Morton-sorted particle state, kept as separate arrays rather than a
+    // vector<Particle>. The near-field direct sum dominates FMM cost at every
+    // useful setting, and striding it through a 36-byte struct defeats
+    // vectorisation entirely; contiguous float arrays let it use full SIMD
+    // width. Accelerations are computed here and scattered back via order_map.
+    std::vector<float> pos_x, pos_y, mass;
+    std::vector<float> acc_x, acc_y;
     std::vector<uint32_t> codes;
     std::vector<int> order_map;      // sorted slot -> original particle index
-    std::vector<uint32_t> scratch_codes;
+    std::vector<uint64_t> sort_keys; // (morton << 32) | original index
 
     std::vector<Level> levels;
     glm::vec2 root_min{0.0f};
@@ -116,6 +164,13 @@ private:
     void sortByMorton();
     void buildLevels();
 
+    // Every per-cell pass goes through here so the coarse levels, which hold
+    // only a handful of cells, run inline instead of paying dispatch.
+    static constexpr int CELL_GRAIN = 64;
+    void forEachCell(int cells, const std::function<void(int, int)>& fn) {
+        pool.parallel_for(0, cells, fn, CELL_GRAIN);
+    }
+
     void upwardPass();
     void interactionPass();
     void downwardPass();
@@ -142,7 +197,12 @@ private:
     float cellSize(int level) const { return root_size / float(1 << level); }
     glm::vec2 cellCenter(int level, uint32_t key) const;
     // Index of the cell with `key` at `level`, or -1 if it holds no particles.
-    int findCell(int level, uint32_t key) const;
+    int findCell(int level, uint32_t key) const { return levels[level].index.find(key); }
+
+    // The largest cell offset an interaction-list entry can have, and the
+    // width of the square translation table that covers it.
+    int m2lReach() const { return 2 * near_radius + 1; }
+    int m2lSpan() const { return 2 * m2lReach() + 1; }
 
     double binom(int n, int k) const { return binomial[n * (2 * p + 3) + k]; }
 };
