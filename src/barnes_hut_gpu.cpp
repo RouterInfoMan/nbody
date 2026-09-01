@@ -77,6 +77,8 @@ void BarnesHutGPU::step(float dt) {
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
+    gpu_boundary.apply(pos_ssbo[cur], vel_ssbo[cur], n, boundary, dt);
+
     current_time += dt;
 }
 

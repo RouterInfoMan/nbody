@@ -873,6 +873,11 @@ void FMMCPU::step(float dt) {
     });
 
     verletStep2(dt);
+
+    if (boundary.active()) {
+        pool.parallel_for(0, n, [&](int a, int b) { applyBoundaryRange(a, b, dt); });
+    }
+
     current_time += dt;
 }
 

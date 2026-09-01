@@ -54,6 +54,7 @@ add_executable(nbody
     src/fmm_cpu.cpp
     src/galaxy_preset.cpp
     src/collapse_preset.cpp
+    src/cloud_presets.cpp
     ${IMGUI_SOURCES}
 )
 
@@ -84,6 +85,7 @@ add_executable(solver_check
     src/fmm_cpu.cpp
     src/galaxy_preset.cpp
     src/collapse_preset.cpp
+    src/cloud_presets.cpp
 )
 
 target_include_directories(solver_check PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -103,6 +105,7 @@ add_executable(sweep
     src/fmm_cpu.cpp
     src/galaxy_preset.cpp
     src/collapse_preset.cpp
+    src/cloud_presets.cpp
 )
 
 target_include_directories(sweep PRIVATE ${CMAKE_SOURCE_DIR}/include)

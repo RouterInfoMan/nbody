@@ -39,6 +39,16 @@ public:
     void renderFromGPU(GLuint pos_ssbo, GLuint vel_ssbo, GLuint mass_ssbo,
                        GLuint id_ssbo, int count, const Camera2D& camera);
 
+    // Overlays the acceleration structure. Call after render()/renderFromGPU()
+    // -- it draws to the default framebuffer on top of the tone-mapped image,
+    // deliberately outside the HDR path so the lines stay crisp and do not bloom.
+    void drawTreeOverlay(GLuint box_ssbo, int box_count, const Camera2D& camera,
+                         int max_depth, float alpha);
+
+    // Outlines the containment wall. Like the tree overlay, drawn after tone
+    // mapping so it stays crisp.
+    void drawBoundary(const Camera2D& camera, int shape, float radius, float alpha);
+
     void setParticleSize(float size) { particle_size = size; needs_update = true; }
     void setNeedsUpdate(bool update) { needs_update = update; }
 
@@ -87,12 +97,16 @@ private:
     std::unique_ptr<Shader> down_shader;
     std::unique_ptr<Shader> up_shader;
     std::unique_ptr<Shader> composite_shader;
+    std::unique_ptr<Shader> tree_collect_shader;
+    std::unique_ptr<Shader> tree_line_shader;
+    std::unique_ptr<Shader> boundary_line_shader;
 
     GLuint particle_vao = 0, particle_vbo = 0;
     GLuint fullscreen_vao = 0;
     GLuint position_ssbo = 0, velocity_ssbo = 0, mass_ssbo = 0;
 
     GLuint hdr_fbo = 0, hdr_tex = 0;
+    GLuint tree_box_ssbo = 0, tree_cmd_ssbo = 0;
 
     struct BloomMip {
         GLuint fbo = 0;
@@ -126,6 +140,9 @@ private:
     bool needs_update = true;
 
     static constexpr int MAX_BLOOM_MIPS = 6;
+    // Cap on boxes the overlay will draw in one frame. Well past what stays
+    // readable, and it bounds the compacted buffer at a few megabytes.
+    static constexpr int TREE_BOX_CAPACITY = 1 << 18;
 
     void setupBuffers();
     void createTargets(int width, int height);

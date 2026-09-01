@@ -1,0 +1,61 @@
+#version 430 core
+
+// Mirrors applyBoundary() in include/boundary.h. The two must stay in step:
+// switching between a CPU and a GPU solver should not change the physics.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 1) buffer VelocityBuffer { vec2 velocities[]; };
+
+uniform int particleCount;
+uniform int mode;        // 1 bounce, 2 drag
+uniform int shape;       // 0 circle, 1 box
+uniform float radius;
+uniform float restitution;
+uniform float drag;
+uniform float dt;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(particleCount)) return;
+
+    vec2 pos = positions[i];
+    vec2 vel = velocities[i];
+
+    if (shape == 0) {
+        float r = length(pos);
+        if (r <= radius || r < 1e-9) return;
+
+        vec2 n = pos / r;
+        if (mode == 1) {
+            // Clamp just inside rather than mirroring the overshoot: a
+            // particle that crossed by more than the wall radius in one step
+            // would otherwise be reflected past the centre.
+            pos = n * (radius * 0.999);
+            float vn = dot(vel, n);
+            if (vn > 0.0) vel -= (1.0 + restitution) * vn * n;
+        } else {
+            vel *= exp(-drag * ((r - radius) / radius) * dt);
+        }
+    } else {
+        if (mode == 1) {
+            for (int k = 0; k < 2; k++) {
+                if (pos[k] > radius) {
+                    pos[k] = radius * 0.999;
+                    if (vel[k] > 0.0) vel[k] = -vel[k] * restitution;
+                } else if (pos[k] < -radius) {
+                    pos[k] = -radius * 0.999;
+                    if (vel[k] < 0.0) vel[k] = -vel[k] * restitution;
+                }
+            }
+        } else {
+            float excess = max(abs(pos.x), abs(pos.y)) - radius;
+            if (excess <= 0.0) return;
+            vel *= exp(-drag * (excess / radius) * dt);
+        }
+    }
+
+    positions[i] = pos;
+    velocities[i] = vel;
+}

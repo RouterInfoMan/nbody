@@ -24,6 +24,9 @@
 #include "barnes_hut_gpu.h"
 #include "brute_force_cpu.h"
 #include "brute_force_gpu.h"
+#include "boundary.h"
+#include "cloud_presets.h"
+#include "gpu_boundary.h"
 #include "collapse_preset.h"
 #include "fmm_cpu.h"
 #include "galaxy_preset.h"
@@ -196,7 +199,8 @@ int main() {
                              "shaders/bh_morton.comp", "shaders/bh_reorder.comp",
                              "shaders/bh_karras.comp", "shaders/bh_propagate.comp",
                              "shaders/bh_force.comp", "shaders/radix_histogram.comp",
-                             "shaders/radix_scan.comp", "shaders/radix_scatter.comp"}) {
+                             "shaders/radix_scan.comp", "shaders/radix_scatter.comp",
+                             "shaders/tree_collect.comp", "shaders/boundary.comp"}) {
         try {
             Shader s(path);
             (void)s;
@@ -212,6 +216,8 @@ int main() {
         {"shaders/fullscreen.vert", "shaders/bloom_down.frag"},
         {"shaders/fullscreen.vert", "shaders/bloom_up.frag"},
         {"shaders/fullscreen.vert", "shaders/composite.frag"},
+        {"shaders/tree_lines.vert", "shaders/tree_lines.frag"},
+        {"shaders/boundary_line.vert", "shaders/boundary_line.frag"},
     };
     for (auto& pr : pairs) {
         try {
@@ -259,6 +265,83 @@ int main() {
         } else {
             std::printf("  HDR draw paths                  PASS\n");
         }
+    }
+
+    // ---- Boundary -------------------------------------------------------
+    // The containment rule exists twice: once in C++ for the CPU solvers and
+    // once in GLSL for the GPU ones. Comparing them on identical input catches
+    // any drift between the two directly, without the chaotic divergence that
+    // makes a solver-level comparison unusable after a few steps.
+    std::printf("\nBoundary CPU/GPU parity\n");
+    {
+        const int n = 20000;
+        std::mt19937 gen(99);
+        std::uniform_real_distribution<float> place(-900.0f, 900.0f);
+        std::uniform_real_distribution<float> speed(-60.0f, 60.0f);
+
+        std::vector<glm::vec2> pos0(n), vel0(n);
+        for (int i = 0; i < n; i++) {
+            pos0[i] = glm::vec2(place(gen), place(gen));   // spans both sides of the wall
+            vel0[i] = glm::vec2(speed(gen), speed(gen));
+        }
+
+        GLuint bufs[2];
+        glGenBuffers(2, bufs);
+
+        for (int shape = 0; shape < BOUNDARY_SHAPE_COUNT; shape++) {
+            for (int mode = BOUNDARY_BOUNCE; mode < BOUNDARY_MODE_COUNT; mode++) {
+                Boundary b;
+                b.mode = mode;
+                b.shape = shape;
+                b.radius = 500.0f;
+                b.restitution = 0.4f;
+                b.drag = 6.0f;
+                const float dt = 0.01f;
+
+                std::vector<Particle> host(n);
+                for (int i = 0; i < n; i++) { host[i].position = pos0[i]; host[i].velocity = vel0[i]; }
+                for (int i = 0; i < n; i++)
+                    applyBoundary(host[i].position, host[i].velocity, b, dt);
+
+                std::vector<glm::vec2> gp = pos0, gv = vel0;
+                const GLsizeiptr bytes = GLsizeiptr(n) * sizeof(glm::vec2);
+                for (int k = 0; k < 2; k++) {
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[k]);
+                    glBufferData(GL_SHADER_STORAGE_BUFFER, bytes,
+                                 k == 0 ? gp.data() : gv.data(), GL_DYNAMIC_COPY);
+                }
+                { GpuBoundary gb; gb.apply(bufs[0], bufs[1], n, b, dt); glFinish(); }
+
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[0]);
+                glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, gp.data());
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufs[1]);
+                glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, gv.data());
+
+                double worst = 0.0;
+                int contained = 0;
+                for (int i = 0; i < n; i++) {
+                    worst = std::max(worst, double(glm::length(host[i].position - gp[i])));
+                    worst = std::max(worst, double(glm::length(host[i].velocity - gv[i])));
+
+                    const float reach = (shape == BOUNDARY_CIRCLE)
+                        ? glm::length(gp[i])
+                        : std::max(std::abs(gp[i].x), std::abs(gp[i].y));
+                    if (reach <= b.radius * 1.0001f) contained++;
+                }
+
+                const bool parity = worst < 1e-3;
+                // Bounce clamps to the wall, so nothing may remain outside it.
+                // Drag only damps, so containment is not expected.
+                const bool ok = parity && (mode != BOUNDARY_BOUNCE || contained == n);
+                if (!ok) failures++;
+
+                std::printf("  %-6s %-6s  max |cpu - gpu| %.2e  inside %d/%d   %s\n",
+                            shape == BOUNDARY_CIRCLE ? "circle" : "box",
+                            mode == BOUNDARY_BOUNCE ? "bounce" : "drag",
+                            worst, contained, n, ok ? "PASS" : "FAIL");
+            }
+        }
+        glDeleteBuffers(2, bufs);
     }
 
     // ---- Presets --------------------------------------------------------
@@ -376,6 +459,110 @@ int main() {
         for (const Particle& part : q2)
             lz3 += double(part.position.x * part.velocity.y - part.position.y * part.velocity.x);
         check("collapse: rotation adds net angular momentum", lz3 > 0.0);
+
+        // --- clouds ---
+        BinaryCloudsParams b;
+        b.count = 20000;
+        b.cloud_radius = 20.0f;
+        b.separation = 300.0f;
+        b.total_mass = 8000.0f;
+        b.mass_ratio = 3.0f;
+        b.support = 0.0f;          // isolates the orbital motion exactly
+
+        std::vector<Particle> bc;
+        BinaryCloudsPreset(b).apply(bc);
+
+        check("binary: count matches getParticleCount()",
+              int(bc.size()) == BinaryCloudsPreset(b).getParticleCount());
+
+        double mass_sum = 0.0, px = 0.0, py = 0.0, cx = 0.0, cy = 0.0;
+        for (const Particle& part : bc) {
+            mass_sum += double(part.mass);
+            px += double(part.mass) * double(part.velocity.x);
+            py += double(part.mass) * double(part.velocity.y);
+            cx += double(part.mass) * double(part.position.x);
+            cy += double(part.mass) * double(part.position.y);
+        }
+        check("binary: total mass matches", std::abs(mass_sum - b.total_mass) < b.total_mass * 1e-3);
+        // Both are exact by construction: the clouds are placed and boosted
+        // with barycentric weights, so any drift means the weighting is wrong.
+        check("binary: barycentre at the origin",
+              std::hypot(cx, cy) < mass_sum * b.separation * 1e-3);
+        check("binary: zero net momentum",
+              std::hypot(px, py) < mass_sum * 1e-3);
+
+        // Uniform particle mass across both clouds keeps relaxation even.
+        bool uniform_mass = true;
+        for (const Particle& part : bc)
+            if (std::abs(part.mass - bc[0].mass) > bc[0].mass * 1e-4f) uniform_mass = false;
+        check("binary: particle mass uniform across both clouds", uniform_mass);
+
+        // Every particle should sit within its cloud's truncation radius.
+        const float m1 = b.total_mass / (1.0f + b.mass_ratio);
+        const float m2 = b.total_mass - m1;
+        const glm::vec2 k1(-b.separation * (m2 / b.total_mass), 0.0f);
+        const glm::vec2 k2( b.separation * (m1 / b.total_mass), 0.0f);
+        bool contained = true;
+        for (const Particle& part : bc) {
+            const float d = std::min(glm::length(part.position - k1),
+                                     glm::length(part.position - k2));
+            if (d > b.cloud_radius * 1.001f) contained = false;
+        }
+        check("binary: particles inside their cloud's truncation radius", contained);
+
+        b.orbit_fraction = 0.0f;
+        std::vector<Particle> bc0;
+        BinaryCloudsPreset(b).apply(bc0);
+        bool at_rest = true;
+        for (const Particle& part : bc0)
+            if (glm::length(part.velocity) > 1e-6f) at_rest = false;
+        check("binary: orbit 0 with no support is a head-on free fall", at_rest);
+
+        CloudClusterParams cl;
+        cl.count = 30000;
+        cl.cloud_count = 6;
+        cl.total_mass = 12000.0f;
+        cl.support = 0.0f;
+
+        std::vector<Particle> cc;
+        CloudClusterPreset(cl).apply(cc);
+        check("cluster: count matches getParticleCount()",
+              int(cc.size()) == CloudClusterPreset(cl).getParticleCount());
+
+        double cluster_mass = 0.0;
+        for (const Particle& part : cc) cluster_mass += double(part.mass);
+        check("cluster: total mass matches",
+              std::abs(cluster_mass - cl.total_mass) < cl.total_mass * 1e-3);
+
+        // That cloud_count distinct, separated clouds were actually emitted.
+        // Comparing individual particles would not show this: the first cloud
+        // is drawn from the same RNG state whatever the count, so particle 0
+        // is legitimately identical. This walks the per-cloud blocks instead
+        // and checks their centroids are all further apart than a cloud is
+        // wide -- which does mean knowing the block layout.
+        {
+            std::vector<glm::vec2> centroids;
+            int offset = 0;
+            for (int i = 0; i < cl.cloud_count; i++) {
+                const int n = cl.count / cl.cloud_count
+                            + (i < cl.count % cl.cloud_count ? 1 : 0);
+                glm::vec2 sum(0.0f);
+                for (int j = offset; j < offset + n; j++) sum += cc[j].position;
+                centroids.push_back(sum / float(n));
+                offset += n;
+            }
+
+            bool covered = offset == int(cc.size());
+            bool separated = true;
+            for (size_t i = 0; i < centroids.size(); i++)
+                for (size_t j = i + 1; j < centroids.size(); j++)
+                    if (glm::length(centroids[i] - centroids[j]) < cl.cloud_radius)
+                        separated = false;
+
+            check("cluster: blocks cover every particle", covered);
+            check("cluster: emits that many separated clouds",
+                  separated && int(centroids.size()) == cl.cloud_count);
+        }
     }
 
     std::printf("\nGPU radix sort\n");

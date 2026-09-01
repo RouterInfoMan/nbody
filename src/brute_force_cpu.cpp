@@ -16,6 +16,12 @@ void BruteForceCPU::step(float dt) {
     verletStep1(dt);
     computeForces();
     verletStep2(dt);
+
+    if (boundary.active()) {
+        const int n = static_cast<int>(particles.size());
+        pool.parallel_for(0, n, [&](int a, int b) { applyBoundaryRange(a, b, dt); });
+    }
+
     current_time += dt;
 }
 

@@ -76,6 +76,7 @@ public:
     BarnesHutCPU(std::unique_ptr<Preset> preset, float theta = 0.7f,
                  float G = 1.0f, float softening = 1.0f,
                  int leaf_cap = 16, int split_threshold = 512);
+    ~BarnesHutCPU() override;
 
     void step(float dt) override;
     void reset() override;
@@ -86,6 +87,9 @@ public:
         softening_sq = soft * soft;
     }
     void setTheta(float t) override { theta = t; inv_theta = 1.0f / t; }
+    bool treeGeometry(GLuint& buffer, int& count) override;
+    const char* treeKind() const override { return "quadtree cells"; }
+
     void setQuadrupole(bool on) { use_quadrupole = on; }
     bool quadrupole() const { return use_quadrupole; }
 
@@ -116,6 +120,11 @@ private:
     bool use_quadrupole = true;
 
     glm::vec2 bounds_min, bounds_max;
+
+    // Debug overlay geometry, built and uploaded only when asked for.
+    GLuint tree_box_ssbo = 0;
+    int tree_box_count = 0;
+    std::vector<glm::vec4> tree_boxes;
 
     void sortByMorton();
     void buildTree();

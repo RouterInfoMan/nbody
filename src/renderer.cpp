@@ -13,6 +13,8 @@ Renderer::~Renderer() {
     if (position_ssbo) glDeleteBuffers(1, &position_ssbo);
     if (velocity_ssbo) glDeleteBuffers(1, &velocity_ssbo);
     if (mass_ssbo) glDeleteBuffers(1, &mass_ssbo);
+    if (tree_box_ssbo) glDeleteBuffers(1, &tree_box_ssbo);
+    if (tree_cmd_ssbo) glDeleteBuffers(1, &tree_cmd_ssbo);
 }
 
 void Renderer::initialize(int width, int height) {
@@ -23,11 +25,25 @@ void Renderer::initialize(int width, int height) {
     down_shader      = std::make_unique<Shader>("shaders/fullscreen.vert", "shaders/bloom_down.frag");
     up_shader        = std::make_unique<Shader>("shaders/fullscreen.vert", "shaders/bloom_up.frag");
     composite_shader = std::make_unique<Shader>("shaders/fullscreen.vert", "shaders/composite.frag");
+    tree_collect_shader = std::make_unique<Shader>("shaders/tree_collect.comp");
+    tree_line_shader = std::make_unique<Shader>("shaders/tree_lines.vert", "shaders/tree_lines.frag");
+    boundary_line_shader = std::make_unique<Shader>("shaders/boundary_line.vert",
+                                                    "shaders/boundary_line.frag");
 
     glGenBuffers(1, &position_ssbo);
     glGenBuffers(1, &velocity_ssbo);
     glGenBuffers(1, &mass_ssbo);
     glGenVertexArrays(1, &fullscreen_vao);
+
+    glGenBuffers(1, &tree_box_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tree_box_ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+                 GLsizeiptr(TREE_BOX_CAPACITY) * sizeof(glm::vec4), nullptr, GL_DYNAMIC_COPY);
+
+    // Four words of indirect draw command plus a slot for the root extent.
+    glGenBuffers(1, &tree_cmd_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tree_cmd_ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, 8 * sizeof(GLuint), nullptr, GL_DYNAMIC_COPY);
 
     setupBuffers();
     createTargets(width, height);
@@ -359,6 +375,64 @@ void Renderer::endScene() {
     // ImGui draws next and expects ordinary alpha blending.
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+void Renderer::drawTreeOverlay(GLuint box_ssbo, int box_count, const Camera2D& camera,
+                               int max_depth, float alpha) {
+    if (!box_ssbo || box_count <= 0 || alpha <= 0.0f) return;
+
+    // count = 0, instanceCount = 1; the collector accumulates into count.
+    const GLuint reset[5] = { 0u, 1u, 0u, 0u, 0u };
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tree_cmd_ssbo);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(reset), reset);
+
+    tree_collect_shader->use();
+    tree_collect_shader->set_int("nodeCount", box_count);
+    tree_collect_shader->set_int("capacity", TREE_BOX_CAPACITY);
+    tree_collect_shader->set_int("maxDepth", max_depth);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, box_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, tree_box_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, tree_cmd_ssbo);
+    glDispatchCompute(static_cast<GLuint>((box_count + 255) / 256), 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+
+    tree_line_shader->use();
+    tree_line_shader->set_mat4("projection", camera.getProjectionMatrix());
+    tree_line_shader->set_int("capacity", TREE_BOX_CAPACITY);
+    tree_line_shader->set_vec3("lineColor", 0.35f, 0.85f, 1.0f);
+    tree_line_shader->set_float("lineAlpha", alpha);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, tree_box_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, tree_cmd_ssbo);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glBindVertexArray(fullscreen_vao);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, tree_cmd_ssbo);
+    glDrawArraysIndirect(GL_LINES, nullptr);
+    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+void Renderer::drawBoundary(const Camera2D& camera, int shape, float radius, float alpha) {
+    if (radius <= 0.0f || alpha <= 0.0f) return;
+
+    const int segments = (shape == 0) ? 256 : 4;
+
+    boundary_line_shader->use();
+    boundary_line_shader->set_mat4("projection", camera.getProjectionMatrix());
+    boundary_line_shader->set_int("shape", shape);
+    boundary_line_shader->set_int("segments", segments);
+    boundary_line_shader->set_float("radius", radius);
+    boundary_line_shader->set_vec3("lineColor", 1.0f, 0.55f, 0.25f);
+    boundary_line_shader->set_float("lineAlpha", alpha);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    glBindVertexArray(fullscreen_vao);
+    glDrawArrays(GL_LINE_LOOP, 0, segments);
+    glBindVertexArray(0);
 }
 
 void Renderer::render(const std::vector<Particle>& particles, const Camera2D& camera, bool force_update) {

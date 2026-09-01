@@ -1,0 +1,56 @@
+#version 430 core
+
+// Compacts the acceleration structure's boxes down to the ones the overlay
+// will actually draw, and writes the indirect draw command for them.
+//
+// Done on the GPU so the tree never has to be read back, and so the draw cost
+// tracks the number of *visible* boxes rather than total node count -- at a
+// million particles the tree holds ~2M nodes but a depth-limited view shows a
+// few thousand.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SrcBoxes  { vec4 srcBoxes[]; };
+layout(std430, binding = 1) writeonly buffer DstBoxes { vec4 dstBoxes[]; };
+// [0..3] are the indirect draw command (count, instanceCount, first,
+// baseInstance); [4] carries the root extent for the line shader, which
+// cannot recover it from the compacted buffer -- slot 0 there belongs to
+// whichever box won the atomic race, not to the root.
+layout(std430, binding = 2) coherent buffer DrawCmd   { uint cmd[]; };
+
+uniform int nodeCount;
+uniform int capacity;      // in boxes
+uniform int maxDepth;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(nodeCount)) return;
+
+    if (i == 0u) {
+        vec2 re = srcBoxes[0].zw - srcBoxes[0].xy;
+        cmd[4] = floatBitsToUint(max(re.x, re.y));
+    }
+
+    vec4 bb = srcBoxes[i];
+    vec2 ext = bb.zw - bb.xy;
+    float e = max(ext.x, ext.y);
+
+    // Leaves of the GPU tree hold one particle and collapse to a point.
+    if (e <= 0.0) return;
+
+    // Depth cut by size relative to the root, which is exact for the CPU
+    // quadtree (a level-L cell is root/2^L) and a good proxy for the GPU's
+    // BVH, whose boxes shrink to the mass they enclose.
+    vec4 root = srcBoxes[0];
+    vec2 rootExt = root.zw - root.xy;
+    float rootE = max(rootExt.x, rootExt.y);
+    if (rootE <= 0.0) return;
+    if (e < rootE / exp2(float(maxDepth))) return;
+
+    // Each box contributes 8 vertices (4 edges), so advancing the vertex count
+    // by 8 also hands out the slot index.
+    uint base = atomicAdd(cmd[0], 8u);
+    uint slot = base >> 3u;
+    if (slot < uint(capacity))
+        dstBoxes[slot] = bb;
+}

@@ -66,6 +66,8 @@ void BruteForceGPU::step(float dt) {
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
+    gpu_boundary.apply(pos_ssbo, vel_ssbo, n, boundary, dt);
+
     current_time += dt;
 }
 

@@ -10,6 +10,40 @@ BarnesHutCPU::BarnesHutCPU(std::unique_ptr<Preset> preset, float theta,
     reset();
 }
 
+BarnesHutCPU::~BarnesHutCPU() {
+    if (tree_box_ssbo) glDeleteBuffers(1, &tree_box_ssbo);
+}
+
+bool BarnesHutCPU::treeGeometry(GLuint& buffer, int& count) {
+    const int live = node_count.load(std::memory_order_relaxed) * 4 + 1;
+    if (live <= 0 || sorted.empty()) return false;
+
+    tree_boxes.clear();
+    tree_boxes.reserve(size_t(live));
+
+    // The root is index 0 and always occupied, so it lands first -- which the
+    // collector relies on to establish the depth scale.
+    for (int i = 0; i < live; i++) {
+        const QuadNode& nd = nodes[i];
+        if (nd.mass <= 0.0f) continue;   // subdivision produces empty children
+        const float h = nd.quad.size * 0.5f;
+        tree_boxes.emplace_back(nd.quad.center.x - h, nd.quad.center.y - h,
+                                nd.quad.center.x + h, nd.quad.center.y + h);
+    }
+    if (tree_boxes.empty()) return false;
+
+    if (!tree_box_ssbo) glGenBuffers(1, &tree_box_ssbo);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, tree_box_ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER,
+                 GLsizeiptr(tree_boxes.size()) * sizeof(glm::vec4),
+                 tree_boxes.data(), GL_STREAM_DRAW);
+
+    tree_box_count = int(tree_boxes.size());
+    buffer = tree_box_ssbo;
+    count = tree_box_count;
+    return true;
+}
+
 void BarnesHutCPU::reset() {
     current_time = 0.0f;
     preset->apply(particles);
@@ -23,6 +57,15 @@ void BarnesHutCPU::reset() {
     const size_t estimated = std::max(size_t(n) * 2, size_t(4096));
     nodes.resize(estimated);
     parent_map.resize(estimated / 4 + 1);
+
+    // Seed the tree and the accelerations. Verlet's first drift needs a(0) to
+    // be right, and it also means the tree exists for the debug overlay before
+    // the simulation has been stepped. The GPU solver already did this.
+    if (n > 0) {
+        sortByMorton();
+        buildTree();
+        computeForces();
+    }
 }
 
 void BarnesHutCPU::step(float dt) {
@@ -31,6 +74,12 @@ void BarnesHutCPU::step(float dt) {
     buildTree();
     computeForces();
     verletStep2(dt);
+
+    if (boundary.active()) {
+        const int n = static_cast<int>(particles.size());
+        pool.parallel_for(0, n, [&](int a, int b) { applyBoundaryRange(a, b, dt); });
+    }
+
     current_time += dt;
 }
 

@@ -17,6 +17,8 @@
 #include "fmm_cpu.h"
 #include "galaxy_preset.h"
 #include "collapse_preset.h"
+#include "cloud_presets.h"
+#include "boundary.h"
 
 #include <algorithm>
 #include <cmath>
@@ -49,6 +51,17 @@ static const char* COLOR_MODE_NAMES[] = {
     "Monochrome",
 };
 
+static const char* BOUNDARY_MODE_NAMES[] = {
+    "Off",
+    "Bounce (wall)",
+    "Drag (absorbing)",
+};
+
+static const char* BOUNDARY_SHAPE_NAMES[] = {
+    "Circle",
+    "Box",
+};
+
 static const char* FMM_KERNEL_NAMES[] = {
     "Softened 1/r^2 (matches other solvers)",
     "Logarithmic (true 2D gravity)",
@@ -57,12 +70,16 @@ static const char* FMM_KERNEL_NAMES[] = {
 enum PresetType {
     PRESET_GALAXY,
     PRESET_COLLAPSE,
+    PRESET_BINARY_CLOUDS,
+    PRESET_CLOUD_CLUSTER,
     PRESET_COUNT
 };
 
 static const char* PRESET_NAMES[] = {
     "Galaxy",
     "Collapse",
+    "Binary Clouds",
+    "Cloud Cluster",
 };
 
 class Application {
@@ -201,6 +218,7 @@ private:
     float intensity = 1.0f;
     float exposure = 1.0f;
     float framed_radius = 0.0f;
+    int tree_boxes_drawn = 0;
     bool rebuild_pending = false;
     bool auto_calibrate = true;
     double calibrate_timer = 0.0;
@@ -222,6 +240,15 @@ private:
 
     GalaxyParams galaxy_params;
     CollapseParams collapse_params;
+    BinaryCloudsParams binary_params;
+    CloudClusterParams cluster_params;
+
+    Boundary boundary;
+    bool show_boundary = true;
+
+    bool show_tree = false;
+    int tree_max_depth = 7;
+    float tree_alpha = 0.5f;
 
     float sim_G = 1.0f;
     float sim_softening = 1.0f;
@@ -276,6 +303,8 @@ private:
             }
         }
 
+        simulation->setBoundary(boundary);
+
         err_max = err_rms = -1.0f;
         err_samples = 0;
         renderer->setNeedsUpdate(true);
@@ -303,6 +332,9 @@ private:
         float extent = 0.0f;
         for (const Particle& part : simulation->getParticles())
             extent = std::max(extent, glm::length(part.position));
+        // A wall the particles have not reached yet is still worth framing.
+        if (boundary.active())
+            extent = std::max(extent, boundary.radius * (boundary.shape == BOUNDARY_BOX ? 1.42f : 1.0f));
 
         if (extent > 0.0f) {
             const bool rescaled = framed_radius <= 0.0f
@@ -361,14 +393,24 @@ private:
         // whichever parameter set is active rather than duplicated in the UI.
         // G matters: the presets balance orbits against it, and a preset built
         // for a different G starts out of equilibrium.
-        if (current_preset == PRESET_COLLAPSE) {
-            collapse_params.count = particle_count;
-            collapse_params.G = sim_G;
-            return std::make_unique<CollapsePreset>(collapse_params);
+        switch (current_preset) {
+            case PRESET_COLLAPSE:
+                collapse_params.count = particle_count;
+                collapse_params.G = sim_G;
+                return std::make_unique<CollapsePreset>(collapse_params);
+            case PRESET_BINARY_CLOUDS:
+                binary_params.count = particle_count;
+                binary_params.G = sim_G;
+                return std::make_unique<BinaryCloudsPreset>(binary_params);
+            case PRESET_CLOUD_CLUSTER:
+                cluster_params.count = particle_count;
+                cluster_params.G = sim_G;
+                return std::make_unique<CloudClusterPreset>(cluster_params);
+            default:
+                galaxy_params.count = particle_count;
+                galaxy_params.G = sim_G;
+                return std::make_unique<GalaxyPreset>(galaxy_params);
         }
-        galaxy_params.count = particle_count;
-        galaxy_params.G = sim_G;
-        return std::make_unique<GalaxyPreset>(galaxy_params);
     }
 
     // Preset parameters. Returns true if anything was edited.
@@ -404,6 +446,35 @@ private:
                                 g.central_mass > 0.0f ? disc / g.central_mass : INFINITY);
             if (disc > g.central_mass * 0.5f && g.velocity_dispersion < 0.05f)
                 ImGui::TextDisabled("Self-gravity dominates: expect fragmentation.");
+        } else if (current_preset == PRESET_BINARY_CLOUDS) {
+            BinaryCloudsParams& b = binary_params;
+            edited |= ImGui::SliderFloat("Cloud Radius", &b.cloud_radius, 1.0f, 2000.0f, "%.1f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Separation", &b.separation, 1.0f, 5000.0f, "%.1f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Total Mass", &b.total_mass, 1.0f, 500000.0f, "%.0f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Mass Ratio", &b.mass_ratio, 0.05f, 20.0f, "%.2f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Orbit", &b.orbit_fraction, 0.0f, 1.5f, "%.2f");
+            edited |= ImGui::SliderFloat("Support", &b.support, 0.0f, 2.0f, "%.2f");
+
+            ImGui::TextDisabled("Orbit 0 = head-on free fall, 1 = circular.\n"
+                                "Support 1 ~ virialised; 0 collapses at once.");
+        } else if (current_preset == PRESET_CLOUD_CLUSTER) {
+            CloudClusterParams& cc = cluster_params;
+            edited |= ImGui::SliderInt("Clouds", &cc.cloud_count, 1, 32);
+            edited |= ImGui::SliderFloat("Cloud Radius", &cc.cloud_radius, 1.0f, 2000.0f, "%.1f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Cluster Radius", &cc.cluster_radius, 1.0f, 5000.0f, "%.1f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Total Mass", &cc.total_mass, 1.0f, 500000.0f, "%.0f",
+                                         ImGuiSliderFlags_Logarithmic);
+            edited |= ImGui::SliderFloat("Orbit", &cc.orbit_fraction, 0.0f, 1.5f, "%.2f");
+            edited |= ImGui::SliderFloat("Support", &cc.support, 0.0f, 2.0f, "%.2f");
+
+            ImGui::TextDisabled("Clouds merge hierarchically; each holds %.4g mass.",
+                                cc.total_mass / float(std::max(1, cc.cloud_count)));
         } else {
             CollapseParams& c = collapse_params;
             edited |= ImGui::SliderFloat("Radius", &c.radius, 1.0f, 5000.0f, "%.1f",
@@ -419,8 +490,11 @@ private:
             ImGui::TextDisabled("Rotation 0 = cold radial collapse, 1 = supported.");
         }
 
-        uint32_t& seed = (current_preset == PRESET_GALAXY) ? galaxy_params.seed
-                                                           : collapse_params.seed;
+        uint32_t* seed_ptr = &galaxy_params.seed;
+        if (current_preset == PRESET_COLLAPSE)            seed_ptr = &collapse_params.seed;
+        else if (current_preset == PRESET_BINARY_CLOUDS)  seed_ptr = &binary_params.seed;
+        else if (current_preset == PRESET_CLOUD_CLUSTER)  seed_ptr = &cluster_params.seed;
+        uint32_t& seed = *seed_ptr;
         int seed_i = int(seed);
         if (ImGui::InputInt("Seed", &seed_i)) {
             seed = uint32_t(std::max(0, seed_i));
@@ -501,6 +575,20 @@ private:
         } else {
             renderer->render(simulation->getParticles(), *camera, !paused);
         }
+
+        if (show_boundary && boundary.active())
+            renderer->drawBoundary(*camera, boundary.shape, boundary.radius, 0.55f);
+
+        if (show_tree) {
+            GLuint boxes = 0;
+            int count = 0;
+            if (simulation->treeGeometry(boxes, count)) {
+                renderer->drawTreeOverlay(boxes, count, *camera, tree_max_depth, tree_alpha);
+                tree_boxes_drawn = count;
+            } else {
+                tree_boxes_drawn = 0;
+            }
+        }
     }
 
     void renderUI() {
@@ -548,6 +636,15 @@ private:
                 }
                 ImGui::TextDisabled("Second moments cost ~5%% and buy ~10x accuracy,\n"
                                     "so theta 0.9-1.2 beats monopole at theta 0.5.");
+
+                ImGui::Checkbox("Show tree", &show_tree);
+                if (show_tree) {
+                    ImGui::SliderInt("Tree Depth", &tree_max_depth, 1, 16);
+                    ImGui::SliderFloat("Tree Opacity", &tree_alpha, 0.05f, 1.0f, "%.2f");
+                    if (simulation)
+                        ImGui::TextDisabled("%d %s (depth-limited)", tree_boxes_drawn,
+                                            simulation->treeKind());
+                }
             }
 
             if (current_alg == ALG_FMM_CPU) {
@@ -595,6 +692,32 @@ private:
 
             ImGui::SliderFloat("Time Step", &dt, 0.001f, 0.1f, "%.4f");
             ImGui::SliderFloat("Time Scale", &time_scale, 0.1f, 10.0f, "%.1f");
+
+            ImGui::SeparatorText("Boundary");
+            bool bc = false;
+            bc |= ImGui::Combo("Containment", &boundary.mode, BOUNDARY_MODE_NAMES,
+                               BOUNDARY_MODE_COUNT);
+            if (boundary.active()) {
+                bc |= ImGui::Combo("Wall Shape", &boundary.shape, BOUNDARY_SHAPE_NAMES,
+                                   BOUNDARY_SHAPE_COUNT);
+                bc |= ImGui::SliderFloat("Wall Radius", &boundary.radius, 10.0f, 20000.0f, "%.0f",
+                                         ImGuiSliderFlags_Logarithmic);
+                if (boundary.mode == BOUNDARY_BOUNCE)
+                    bc |= ImGui::SliderFloat("Restitution", &boundary.restitution, 0.0f, 1.0f, "%.2f");
+                else
+                    bc |= ImGui::SliderFloat("Drag", &boundary.drag, 0.0f, 40.0f, "%.1f");
+
+                ImGui::Checkbox("Show wall", &show_boundary);
+                ImGui::TextDisabled(boundary.mode == BOUNDARY_BOUNCE
+                    ? "Reflects the outward velocity component;\n"
+                      "restitution 1 is perfectly elastic."
+                    : "Damps velocity beyond the wall, ramping with\n"
+                      "distance, so escapers slow and fall back.");
+            }
+            // Applied live: containment is not part of the initial conditions,
+            // so changing it needs no rebuild.
+            if (bc && simulation) simulation->setBoundary(boundary);
+
             ImGui::PopID();
         }
 

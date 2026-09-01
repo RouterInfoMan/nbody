@@ -2,6 +2,7 @@
 #include "simulation.h"
 #include "preset.h"
 #include "shader.h"
+#include "gpu_boundary.h"
 #include <GL/glew.h>
 #include <memory>
 
@@ -21,6 +22,7 @@ public:
     void syncToHost() override;
 
 private:
+    GpuBoundary gpu_boundary;
     std::unique_ptr<Preset> preset;
     float G;
     float softening;

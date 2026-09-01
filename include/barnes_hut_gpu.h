@@ -2,6 +2,7 @@
 #include "simulation.h"
 #include "preset.h"
 #include "shader.h"
+#include "gpu_boundary.h"
 #include "gpu_radix_sort.h"
 #include <GL/glew.h>
 #include <memory>
@@ -31,12 +32,25 @@ public:
     GLuint idBuffer() const override { return id_ssbo[cur]; }
     void syncToHost() override;
 
+    // The traversal's own AABBs, handed over as-is: the overlay needs no copy
+    // and no readback. Leaves hold one particle and collapse to a point, which
+    // the collector culls.
+    bool treeGeometry(GLuint& buffer, int& count) override {
+        const int n = getParticleCount();
+        if (n < 2 || !node_aabb_ssbo) return false;
+        buffer = node_aabb_ssbo;
+        count = 2 * n - 1;
+        return true;
+    }
+    const char* treeKind() const override { return "LBVH node AABBs"; }
+
     void setPhysics(float g, float soft) override { G = g; softening = soft; }
     void setTheta(float t) override { theta = t; }
     void setQuadrupole(bool on) { use_quadrupole = on; }
     bool quadrupole() const { return use_quadrupole; }
 
 private:
+    GpuBoundary gpu_boundary;
     std::unique_ptr<Preset> preset;
 
     float theta;
