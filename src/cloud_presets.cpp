@@ -13,13 +13,8 @@ void emit(std::vector<Particle>& out, std::mt19937& gen, int n,
     const float r_max = std::max(shape.radius, 1e-3f);
     const float a = r_max / 3.0f;
 
-    // 2D Plummer: M(<r)/M = r^2 / (r^2 + a^2), so the inverse CDF is
-    // r = a * sqrt(u / (1 - u)). Sampling u only up to the value that maps to
-    // r_max truncates the profile cleanly instead of rejection-sampling.
     const float u_max = (r_max * r_max) / (r_max * r_max + a * a);
 
-    // Virial estimate: a bound self-gravitating system has <v^2> ~ GM/R, split
-    // across two dimensions. Approximate, which is why `support` is a slider.
     const float sigma = shape.support * std::sqrt(G * mass / (2.0f * a));
 
     std::uniform_real_distribution<float> unit(0.0f, u_max);
@@ -57,8 +52,6 @@ void BinaryCloudsPreset::apply(std::vector<Particle>& particles) {
 
     const float d = std::max(params.separation, 1e-3f);
 
-    // Both clouds orbit the barycentre, so each sits at a distance weighted by
-    // the *other* one's mass and moves at a speed weighted the same way.
     const glm::vec2 c1(-d * (m2 / total), 0.0f);
     const glm::vec2 c2( d * (m1 / total), 0.0f);
 
@@ -70,8 +63,6 @@ void BinaryCloudsPreset::apply(std::vector<Particle>& particles) {
     shape.radius = params.cloud_radius;
     shape.support = params.support;
 
-    // Split the particle budget by mass so both clouds have the same particle
-    // mass, which keeps two-body relaxation uniform across the pair.
     const int n1 = std::clamp(int(std::lround(double(params.count) * double(m1) / double(total))),
                               1, params.count - 1);
     const int n2 = params.count - n1;
@@ -103,8 +94,6 @@ void CloudClusterPreset::apply(std::vector<Particle>& particles) {
     std::uniform_real_distribution<float> angle_dist(0.0f, 2.0f * glm::pi<float>());
 
     for (int i = 0; i < k; i++) {
-        // Even split of the budget, with the remainder spread over the first
-        // few clouds so the totals match getParticleCount() exactly.
         const int n = params.count / k + (i < params.count % k ? 1 : 0);
 
         // sqrt keeps the cloud centres uniform over the cluster area.
@@ -112,8 +101,6 @@ void CloudClusterPreset::apply(std::vector<Particle>& particles) {
         const float theta = angle_dist(gen);
         const glm::vec2 center(r * std::cos(theta), r * std::sin(theta));
 
-        // Circular speed against the mass interior to this cloud. Uniform
-        // area coverage means the enclosed fraction is (r / cluster_r)^2.
         glm::vec2 bulk(0.0f);
         if (r > 1e-4f) {
             const float enclosed = total * (r * r) / (cluster_r * cluster_r);

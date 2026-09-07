@@ -7,6 +7,7 @@ struct Particle {
     glm::vec2 acceleration{0.0f};
     glm::vec2 prev_acceleration{0.0f};
     float mass = 1.0f;
+    float potential = 0.0f;
 
     Particle() = default;
 

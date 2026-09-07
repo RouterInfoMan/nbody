@@ -5,14 +5,7 @@
 #include <cstring>
 #include <vector>
 
-// Parallel LSD radix sort over the high 32 bits of packed
-// (key << 32 | payload) values.
-//
-// Only the key half is sorted -- four byte passes instead of eight -- and
-// because each pass is stable the payload half stays in ascending order
-// within a run of equal keys, which is exactly the tie-break a Morton sort
-// wants. Packing key and payload into one 64-bit word also keeps the scatter
-// to a single stream instead of two.
+// Parallel LSD radix sort over the key half of packed (key << 32 | payload).
 class CpuRadixSort {
 public:
     static constexpr int RADIX = 256;
@@ -50,8 +43,6 @@ public:
                 }
             });
 
-            // Exclusive scan in bin-major order, so each chunk's run of a
-            // given digit lands contiguously and the scatter stays stable.
             uint32_t running = 0;
             for (int bin = 0; bin < RADIX; bin++) {
                 for (int c = 0; c < chunks; c++) {

@@ -29,9 +29,6 @@ inline uint32_t mortonEncode(uint32_t x, uint32_t y) {
     return expandBits16(x) | (expandBits16(y) << 1);
 }
 
-// Number of 2D multi-indices with total degree <= q, and the flat index of
-// one such multi-index. Degrees are laid out in blocks: (0,0) | (1,0) (0,1) |
-// (2,0) (1,1) (0,2) | ...
 inline int triCount(int q) { return (q + 1) * (q + 2) / 2; }
 inline int triIndex(int a, int b) { int d = a + b; return d * (d + 1) / 2 + b; }
 
@@ -40,14 +37,7 @@ inline uint32_t keyAtLevel(uint32_t code, int level, int max_depth) {
     return shift >= 32 ? 0u : (code >> shift);
 }
 
-// Taylor coefficients T_gamma = d^gamma K(R) / gamma! of the softened kernel
-// K(r) = 1/sqrt(|r|^2 + eps^2), expanded about R, up to total degree q.
-//
-// With u(d) = |R+d|^2 + eps^2 = A + B and B(0) = 0, the binomial series
-// (A+B)^(-1/2) = A^(-1/2) * sum_k C(-1/2,k) (B/A)^k is a formal power series
-// in d whose k-th term has minimum degree k. Truncating at k = q therefore
-// reproduces the degree-q Taylor polynomial exactly -- no convergence
-// condition, and B has only four terms so each power costs almost nothing.
+// Taylor coefficients of K(r) = 1/sqrt(r^2 + eps^2) about R, to degree q.
 void taylorSoftened(double Rx, double Ry, double eps_sq, int q, std::vector<double>& T) {
     const int n = triCount(q);
     T.assign(n, 0.0);
@@ -142,7 +132,7 @@ void FMMCPU::reset() {
 
     const size_t n = particles.size();
     pos_x.resize(n); pos_y.resize(n); mass.resize(n);
-    acc_x.resize(n); acc_y.resize(n);
+    acc_x.resize(n); acc_y.resize(n); pot.resize(n);
     codes.resize(n);
     sort_keys.resize(n);
     order_map.resize(n);
@@ -216,8 +206,6 @@ void FMMCPU::rebuildTables() {
 }
 
 // ---------------------------------------------------------------------------
-// Tree
-// ---------------------------------------------------------------------------
 
 void FMMCPU::sortByMorton() {
     const int n = static_cast<int>(particles.size());
@@ -230,8 +218,6 @@ void FMMCPU::sortByMorton() {
         hi = glm::max(hi, part.position);
     }
 
-    // FMM needs square cells so that a translation depends only on the integer
-    // cell offset, so the root box is a square, not the tight AABB.
     const glm::vec2 extent = hi - lo;
     float side = std::max(std::max(extent.x, extent.y), 1e-6f) * 1.02f;
     root_min = 0.5f * (lo + hi) - glm::vec2(side * 0.5f);
@@ -286,8 +272,6 @@ void FMMCPU::buildLevels() {
         lv.index.build(lv.keys);
     }
 
-    // Children of a cell share its key prefix and the key arrays are sorted,
-    // so each parent's children form one contiguous run.
     for (int l = 1; l <= max_level; l++) {
         Level& child = levels[l];
         Level& parent = levels[l - 1];
@@ -328,8 +312,6 @@ void FMMCPU::buildTree() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cartesian (softened inverse-square) expansions
 // ---------------------------------------------------------------------------
 
 void FMMCPU::buildM2LMatrices() {
@@ -452,10 +434,6 @@ void FMMCPU::cartM2L(int level) {
             const int ty = int(compactBits(key >> 1));
             double* dst = &L[size_t(c) * stride];
 
-            // The interaction list is the children of the parent's neighbours
-            // that are not themselves neighbours of this cell. Enumerating the
-            // integer offsets directly is equivalent and avoids materialising
-            // the list.
             for (int dy = -reach; dy <= reach; dy++) {
                 const int sy = ty + dy;
                 if (sy < 0 || sy >= int(grid)) continue;
@@ -466,8 +444,6 @@ void FMMCPU::cartM2L(int level) {
                     const int sx = tx + dx;
                     if (sx < 0 || sx >= int(grid)) continue;
 
-                    // Only cells sharing a parent-neighbour are well separated
-                    // at this level; the rest are handled one level up.
                     if (std::abs((sx >> 1) - (tx >> 1)) > ws) continue;
                     if (std::abs((sy >> 1) - (ty >> 1)) > ws) continue;
 
@@ -557,13 +533,16 @@ void FMMCPU::cartL2P() {
 
                 acc_x[b] = float(gx) * g;
                 acc_y[b] = float(gy) * g;
+
+                double psi = 0.0;
+                for (int i = 0; i < stride; i++)
+                    psi += src[i] * sx_pow[alpha_x[i]] * sy_pow[alpha_y[i]];
+                pot[b] = float(-psi * double(g));
             }
         }
     });
 }
 
-// ---------------------------------------------------------------------------
-// Complex (logarithmic) expansions -- classic Greengard-Rokhlin 2D FMM
 // ---------------------------------------------------------------------------
 
 void FMMCPU::cxP2M() {
@@ -670,9 +649,6 @@ void FMMCPU::cxM2L(int level) {
 
                     const std::complex<double>* a = &M[size_t(src_cell) * stride];
 
-                    // b_0 only shifts the potential by a constant and never
-                    // reaches the force, so it is skipped (which also avoids a
-                    // complex log per interaction).
                     for (int l = 1; l <= p; l++) {
                         std::complex<double> acc = -a[0] * inv_pow[l] / double(l);
                         std::complex<double> inner(0.0, 0.0);
@@ -742,8 +718,6 @@ void FMMCPU::cxL2P() {
                     pw *= w;
                 }
 
-                // phi_real = G * sum m log r, and grad(Re f) = (Re f', -Im f'),
-                // so the attractive acceleration is -G * (Re Phi', -Im Phi').
                 acc_x[b] = float(-g * deriv.real());
                 acc_y[b] = float(g * deriv.imag());
             }
@@ -751,8 +725,6 @@ void FMMCPU::cxL2P() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Passes
 // ---------------------------------------------------------------------------
 
 void FMMCPU::upwardPass() {
@@ -820,7 +792,7 @@ void FMMCPU::nearFieldPass() {
 
                     for (int i = leaf.body_start[c]; i < leaf.body_end[c]; i++) {
                         const float pix = pos_x[i], piy = pos_y[i];
-                        float ax = 0.0f, ay = 0.0f;
+                        float ax = 0.0f, ay = 0.0f, psi = 0.0f;
 
                         if (log_kernel) {
                             for (int j = js; j < je; j++) {
@@ -837,13 +809,18 @@ void FMMCPU::nearFieldPass() {
                                 const float w = smp[j] * inv * inv * inv;
                                 ax += dx * w;
                                 ay += dy * w;
+                                psi += smp[j] * inv;
                             }
                         }
 
-                        // Self-interaction contributes exactly zero (d = 0),
-                        // matching brute force, which also does not skip it.
                         acc_x[i] += ax * g;
                         acc_y[i] += ay * g;
+                        if (!log_kernel) {
+                            // The self term is a spurious m/eps, not zero.
+                            const float self = (i >= js && i < je)
+                                ? smp[i] / std::sqrt(eps_sq) : 0.0f;
+                            pot[i] -= (psi - self) * g;
+                        }
                     }
                 }
             }
@@ -851,8 +828,6 @@ void FMMCPU::nearFieldPass() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Stepping
 // ---------------------------------------------------------------------------
 
 void FMMCPU::step(float dt) {
@@ -868,8 +843,10 @@ void FMMCPU::step(float dt) {
 
     const int n = static_cast<int>(particles.size());
     pool.parallel_for(0, n, [&](int start, int end) {
-        for (int i = start; i < end; i++)
+        for (int i = start; i < end; i++) {
             particles[order_map[i]].acceleration = glm::vec2(acc_x[i], acc_y[i]);
+            particles[order_map[i]].potential = pot[i];
+        }
     });
 
     verletStep2(dt);

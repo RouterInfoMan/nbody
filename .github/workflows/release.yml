@@ -1,0 +1,132 @@
+name: Release
+
+# Manual only: pick a tag and publish. Nothing here runs on push.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, e.g. v1.0.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as a pre-release"
+        type: boolean
+        default: false
+      draft:
+        description: "Create as a draft (publish by hand afterwards)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-mingw-w64-x86-64
+
+      # NATIVE_ARCH must stay off. It tunes for whatever CPU built the binary,
+      # which would crash on anything older. The portable target is AVX2.
+      - name: Build
+        run: |
+          cmake -S . -B build-win \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DNBODY_NATIVE_ARCH=OFF
+          cmake --build build-win -j"$(nproc)"
+
+      - name: Verify the binary is self-contained
+        run: |
+          deps=$(x86_64-w64-mingw32-objdump -p build-win/nbody.exe \
+                 | awk '/DLL Name/ {print $3}' | sort -u)
+          echo "$deps"
+          if echo "$deps" | grep -qiE 'libstdc|libgcc|libwinpthread|glfw|glew'; then
+            echo "::error::nbody.exe depends on a non-system DLL"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          name="nbody-${{ inputs.tag }}-windows-x64"
+          mkdir -p "dist/$name"
+          cp build-win/nbody.exe build-win/solver_check.exe build-win/benchmark.exe "dist/$name/"
+          cp -r shaders "dist/$name/"
+          cp README.md "dist/$name/"
+          [ -f LICENSE ] && cp LICENSE "dist/$name/" || true
+          cd dist && zip -r "$name.zip" "$name" > /dev/null
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*.zip
+
+  linux:
+    name: Linux package
+    # Older runner on purpose: binaries link against the glibc they are built
+    # with, so building on the oldest supported image widens what they run on.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake \
+            libglfw3-dev libglew-dev libglm-dev libgl-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNBODY_NATIVE_ARCH=OFF
+          cmake --build build -j"$(nproc)"
+
+      - name: Package
+        run: |
+          name="nbody-${{ inputs.tag }}-linux-x64"
+          mkdir -p "dist/$name"
+          cp build/nbody build/solver_check build/benchmark "dist/$name/"
+          cp -r shaders "dist/$name/"
+          cp README.md "dist/$name/"
+          [ -f LICENSE ] && cp LICENSE "dist/$name/" || true
+          # Unlike the Windows build this links GLFW and GLEW dynamically.
+          cat > "dist/$name/RUNNING.txt" <<'TXT'
+          Needs an OpenGL 4.3 driver plus GLFW and GLEW at runtime:
+            sudo apt install libglfw3 libglew2.2
+          Run from this directory -- shaders are loaded relative to the
+          working directory.
+          TXT
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          flags=""
+          [ "${{ inputs.prerelease }}" = "true" ] && flags="$flags --prerelease"
+          [ "${{ inputs.draft }}" = "true" ] && flags="$flags --draft"
+          gh release create "$TAG" --title "$TAG" --generate-notes $flags \
+            $(find dist -type f \( -name '*.zip' -o -name '*.tar.gz' \))

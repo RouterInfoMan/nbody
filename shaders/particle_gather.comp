@@ -1,7 +1,6 @@
 #version 430 core
 
-// Fallback for the GPU-resident render path when no velocity buffer is
-// available: positions only, flat warm-white emission.
+// Fallback when no velocity buffer is available: flat colour.
 
 layout(local_size_x = 256) in;
 

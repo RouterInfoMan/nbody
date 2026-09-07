@@ -19,11 +19,13 @@
 #include "collapse_preset.h"
 #include "cloud_presets.h"
 #include "boundary.h"
+#include "thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
 #include <random>
 #include <vector>
+#include <cfloat>
 
 static const int INIT_WIDTH = 1280;
 static const int INIT_HEIGHT = 720;
@@ -169,8 +171,12 @@ public:
 
             processInput(delta);
 
-            // The speed distribution drifts as the system heats, so the colour
-            // ramp is periodically refitted to it -- auto-exposure, in effect.
+            energy_timer += delta;
+            if (energy_auto && !paused && simulation && energy_timer > double(energy_interval)) {
+                energy_timer = 0.0;
+                measureEnergy();
+            }
+
             calibrate_timer += delta;
             if (auto_calibrate && !paused && simulation && calibrate_timer > 1.0) {
                 calibrate_timer = 0.0;
@@ -220,8 +226,62 @@ private:
     float framed_radius = 0.0f;
     int tree_boxes_drawn = 0;
     bool rebuild_pending = false;
+
+    bool energy_auto = true;
+    float energy_interval = 0.25f;
+    double energy_timer = 0.0;
+    bool e_available = false;
+
+    double e_kinetic = 0.0;
+    double e_potential = 0.0;
+    double e_total = 0.0;
+    double e_reference = 0.0;      // first reading after a rebuild
+    bool e_have_reference = false;
+    double energy_ms = 0.0;
+
+    static constexpr int ENERGY_HISTORY = 512;
+    std::vector<float> e_hist_total, e_hist_kinetic;
+    int e_hist_count = 0;
+
+    void resetEnergy() {
+        e_kinetic = e_potential = e_total = e_reference = 0.0;
+        e_have_reference = false;
+        e_hist_total.assign(ENERGY_HISTORY, 0.0f);
+        e_hist_kinetic.assign(ENERGY_HISTORY, 0.0f);
+        e_hist_count = 0;
+        energy_timer = 0.0;
+    }
+
+    void measureEnergy() {
+        if (!simulation) return;
+
+        const auto t0 = std::chrono::high_resolution_clock::now();
+
+        double k = 0.0, u = 0.0;
+        e_available = simulation->energyTotals(k, u);
+        if (!e_available) return;
+
+        e_kinetic = k;
+        e_potential = u;
+        e_total = k + u;
+
+        if (!e_have_reference) {
+            e_reference = e_total;
+            e_have_reference = true;
+        }
+
+        if (e_hist_total.empty()) resetEnergy();
+        e_hist_total[e_hist_count % ENERGY_HISTORY] = float(e_total);
+        e_hist_kinetic[e_hist_count % ENERGY_HISTORY] = float(e_kinetic);
+        e_hist_count++;
+
+        const auto t1 = std::chrono::high_resolution_clock::now();
+        energy_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+
     bool auto_calibrate = true;
     double calibrate_timer = 0.0;
+
     bool bloom_enabled = true;
     float bloom_strength = 0.55f;
     float bloom_threshold = 0.7f;
@@ -230,9 +290,12 @@ private:
     float saturation = 1.65f;
     float hue_preserve = 0.75f;
     float variety = 0.6f;
+
     int fps = 0;
     double sim_ms = 0.0;
     double render_ms = 0.0;
+
+    bool sync_gpu_timing = true;
 
     int current_alg = ALG_BARNES_HUT_CPU;
     int current_preset = PRESET_GALAXY;
@@ -260,10 +323,6 @@ private:
     int fmm_leaf_capacity = 32;
     int fmm_near_radius = 2;
     int fmm_depth = 0;          // 0 = auto
-
-    // GPU solvers no longer stall on a readback, so timing them needs an
-    // explicit sync; without it sim_ms would only measure command submission.
-    bool sync_gpu_timing = true;
 
     float err_max = -1.0f;
     float err_rms = -1.0f;
@@ -304,31 +363,18 @@ private:
         }
 
         simulation->setBoundary(boundary);
+        resetEnergy();
 
         err_max = err_rms = -1.0f;
         err_samples = 0;
         renderer->setNeedsUpdate(true);
-        // The preset's initial state is representative, and at t = 0 the host
-        // copy is valid even for GPU solvers, so this costs no readback.
         renderer->calibrateRange(simulation->getParticles());
         calibrate_timer = 0.0;
 
-        // Emission is additive, so the same per-particle brightness that looks
-        // right at ten thousand particles saturates the whole core at a
-        // million. Scale it with density so every count starts out legible;
-        // the slider still overrides.
         const float n = float(std::max(1, simulation->getParticleCount()));
         intensity = std::clamp(1.9f * std::sqrt(20000.0f / n), 0.15f, 2.5f);
         renderer->setIntensity(intensity);
 
-        // Frame the new configuration, and make R return there. Measured from
-        // the particles rather than read off a preset field, so it stays
-        // correct for any preset.
-        //
-        // Only jump the view when the scale actually changed. A rebuild fires
-        // for every preset tweak, and yanking the camera back each time you
-        // nudge dispersion or reroll the seed -- while zoomed into the core --
-        // would make those controls unusable.
         float extent = 0.0f;
         for (const Particle& part : simulation->getParticles())
             extent = std::max(extent, glm::length(part.position));
@@ -344,10 +390,6 @@ private:
         }
     }
 
-    // Compares the solver's current accelerations against a direct sum over
-    // every particle, for an evenly spaced sample of targets. The state is
-    // already consistent after a step (positions were advanced, then forces
-    // recomputed at those positions), so no extra stepping is needed.
     void validateAgainstBruteForce() {
         if (!simulation) return;
 
@@ -389,10 +431,6 @@ private:
     }
 
     std::unique_ptr<Preset> makePreset() {
-        // Particle count and G are shared controls, so they are pushed into
-        // whichever parameter set is active rather than duplicated in the UI.
-        // G matters: the presets balance orbits against it, and a preset built
-        // for a different G starts out of equilibrium.
         switch (current_preset) {
             case PRESET_COLLAPSE:
                 collapse_params.count = particle_count;
@@ -417,16 +455,11 @@ private:
     bool presetControls() {
         bool edited = false;
 
-        // The two parameter sets reuse labels ("Central Mass", "Particle
-        // Mass", "Dispersion"), so scope them per preset. Only one branch is
-        // ever submitted, but without this they share an ID and any in-flight
-        // widget state would carry across a preset switch.
+        // Scope per preset: the two sets reuse labels and would share ImGui IDs.
         ImGui::PushID(current_preset);
 
         if (current_preset == PRESET_GALAXY) {
             GalaxyParams& g = galaxy_params;
-            // Logarithmic: the range spans five decades, and on a linear slider
-            // everything below a few hundred would collapse into a few pixels.
             edited |= ImGui::SliderFloat("Inner Radius", &g.inner_radius, 0.1f, 5000.0f, "%.1f",
                                          ImGuiSliderFlags_Logarithmic);
             edited |= ImGui::SliderFloat("Outer Radius", &g.outer_radius, 1.0f, 5000.0f, "%.1f",
@@ -495,6 +528,7 @@ private:
         else if (current_preset == PRESET_BINARY_CLOUDS)  seed_ptr = &binary_params.seed;
         else if (current_preset == PRESET_CLOUD_CLUSTER)  seed_ptr = &cluster_params.seed;
         uint32_t& seed = *seed_ptr;
+
         int seed_i = int(seed);
         if (ImGui::InputInt("Seed", &seed_i)) {
             seed = uint32_t(std::max(0, seed_i));
@@ -561,8 +595,6 @@ private:
     }
 
     void renderScene() {
-        // The renderer owns its HDR target and clears it itself; clearing the
-        // default framebuffer here would only be overwritten by the composite.
         if (!simulation) return;
 
         if (simulation->isGPUResident()) {
@@ -591,27 +623,72 @@ private:
         }
     }
 
+    void drawEnergyWindow(float x, float w) {
+        ImGui::SetNextWindowPos(ImVec2(x, 560.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(w, 260.0f), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Energy");
+        ImGui::PushID("energy");
+
+        if (e_have_reference) {
+            const double drift = (e_reference != 0.0)
+                ? (e_total - e_reference) / std::abs(e_reference) * 100.0 : 0.0;
+
+            ImGui::Text("Kinetic    %+.6g", e_kinetic);
+            ImGui::Text("Potential  %+.6g", e_potential);
+            ImGui::Separator();
+            ImGui::Text("Total      %+.6g", e_total);
+
+            ImGui::TextColored(std::abs(drift) < 1.0 ? ImVec4(0.6f, 0.9f, 0.6f, 1.0f)
+                                                     : ImVec4(1.0f, 0.7f, 0.4f, 1.0f),
+                               "Drift      %+.3f %% since reset", drift);
+
+            const int count = std::min(e_hist_count, ENERGY_HISTORY);
+            const int offset = (e_hist_count > ENERGY_HISTORY) ? (e_hist_count % ENERGY_HISTORY) : 0;
+            ImGui::PlotLines("##etot", e_hist_total.data(), count, offset,
+                             "total energy", FLT_MAX, FLT_MAX, ImVec2(-1, 60));
+            ImGui::PlotLines("##ekin", e_hist_kinetic.data(), count, offset,
+                             "kinetic", FLT_MAX, FLT_MAX, ImVec2(-1, 45));
+        } else if (simulation && !e_available && e_hist_count == 0 && !energy_auto) {
+            ImGui::TextDisabled("Not available for this solver.");
+        } else {
+            ImGui::TextDisabled("No measurement yet.");
+        }
+
+        ImGui::Separator();
+        ImGui::Checkbox("Auto", &energy_auto);
+        ImGui::SameLine();
+        if (ImGui::Button("Measure now")) measureEnergy();
+        ImGui::SameLine();
+        if (ImGui::Button("Reset baseline")) resetEnergy();
+
+        ImGui::SliderFloat("Interval (s)", &energy_interval, 0.05f, 5.0f, "%.2f");
+        ImGui::TextDisabled("%.2f ms per measurement", energy_ms);
+        ImGui::TextDisabled("Exact to the solver's own accuracy.");
+
+        ImGui::PopID();
+        ImGui::End();
+    }
+
     void renderUI() {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(410, 680), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Simulation Controls");
+        int fbw = INIT_WIDTH, fbh = INIT_HEIGHT;
+        glfwGetFramebufferSize(window, &fbw, &fbh);
+        const float right_w = 400.0f;
+        const float right_x = float(fbw) - right_w - 10.0f;
 
-        // Declared up front because the sections that set them are
-        // collapsible: a folded section submits no widgets, and the rebuild
-        // decision at the bottom still has to be made.
+        ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(410, float(fbh) - 20.0f), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Simulation");
+
         bool alg_changed = false;
         bool preset_changed = false;
         bool rebuild_needed = false;
         bool count_changed = false;
         bool preset_params_changed = false;
 
-        // Transport stays outside the collapsible sections so it is always
-        // reachable. The button is submitted unconditionally -- a widget
-        // short-circuited out of a boolean chain is not drawn that frame.
         const bool reset_clicked = ImGui::Button("Reset");
         ImGui::SameLine();
         if (ImGui::Button(paused ? "Play (Space)" : "Pause (Space)"))
@@ -714,14 +791,18 @@ private:
                     : "Damps velocity beyond the wall, ramping with\n"
                       "distance, so escapers slow and fall back.");
             }
-            // Applied live: containment is not part of the initial conditions,
-            // so changing it needs no rebuild.
             if (bc && simulation) simulation->setBoundary(boundary);
 
             ImGui::PopID();
         }
 
-        if (ImGui::CollapsingHeader("Appearance")) {
+        ImGui::End();   // Simulation
+
+        ImGui::SetNextWindowPos(ImVec2(right_x, 10.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(right_w, 300.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
+        ImGui::Begin("Appearance");
+        {
             ImGui::PushID("appearance");
             if (ImGui::SliderFloat("Point Size", &particle_size, 1.0f, 20.0f))
                 renderer->setParticleSize(particle_size);
@@ -792,7 +873,13 @@ private:
             ImGui::PopID();
         }
 
-        if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::End();   // Appearance
+
+        ImGui::SetNextWindowPos(ImVec2(right_x, 320.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(right_w, 230.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowCollapsed(true, ImGuiCond_FirstUseEver);
+        ImGui::Begin("Performance");
+        {
             ImGui::PushID("performance");
             if (simulation) {
                 ImGui::Text("Particles: %d", simulation->getParticleCount());
@@ -836,9 +923,11 @@ private:
             ImGui::PopID();
         }
 
-        // Sliders report an edit on every frame they are dragged, and a
-        // rebuild reallocates every buffer and re-seeds the whole system.
-        // Defer until the control is released so dragging stays interactive.
+        ImGui::End();   // Performance
+
+        drawEnergyWindow(right_x, right_w);
+
+        // Defer the rebuild until the slider is released.
         if (rebuild_needed || preset_params_changed || count_changed)
             rebuild_pending = true;
 
@@ -849,7 +938,6 @@ private:
             createSimulation();
         }
 
-        ImGui::End();
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     }

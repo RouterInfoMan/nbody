@@ -9,11 +9,6 @@ void allocBuffer(GLuint& buf, GLsizeiptr bytes, const void* data = nullptr) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, bytes, data, GL_DYNAMIC_DRAW);
 }
 
-void clearUint(GLuint buf, GLuint value) {
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf);
-    glClearBufferData(GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_RED_INTEGER,
-                      GL_UNSIGNED_INT, &value);
-}
 }  // namespace
 
 BarnesHutGPU::BarnesHutGPU(std::unique_ptr<Preset> preset, float theta,
@@ -23,7 +18,8 @@ BarnesHutGPU::BarnesHutGPU(std::unique_ptr<Preset> preset, float theta,
     morton_shader    = std::make_unique<Shader>("shaders/bh_morton.comp");
     reorder_shader   = std::make_unique<Shader>("shaders/bh_reorder.comp");
     karras_shader    = std::make_unique<Shader>("shaders/bh_karras.comp");
-    propagate_shader = std::make_unique<Shader>("shaders/bh_propagate.comp");
+    merge_shader     = std::make_unique<Shader>("shaders/bh_merge.comp");
+    merge_level_loc  = glGetUniformLocation(merge_shader->id(), "level");
     force_shader     = std::make_unique<Shader>("shaders/bh_force.comp");
     verlet1_shader   = std::make_unique<Shader>("shaders/verlet_step1.comp");
     verlet2_shader   = std::make_unique<Shader>("shaders/verlet_step2.comp");
@@ -67,8 +63,6 @@ void BarnesHutGPU::step(float dt) {
 
     buildTreeAndComputeForces();
 
-    // Second half kick. Note the state was permuted into Morton order in
-    // between; velocities were permuted with it, so this stays consistent.
     verlet2_shader->use();
     verlet2_shader->set_int("particleCount", n);
     verlet2_shader->set_float("dt", dt);
@@ -129,35 +123,36 @@ void BarnesHutGPU::buildTreeAndComputeForces() {
     cur = 1 - cur;
 
     // --- Radix tree ---------------------------------------------------
-    // The root is the only node nothing links to, so its parent slot is the
-    // sentinel that terminates the upward walk in bh_propagate.
-    clearUint(node_flags_ssbo, 0u);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, node_parent_ssbo);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(GLuint), &NO_PARENT);
-
     karras_shader->use();
     karras_shader->set_int("particleCount", n);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, key_ssbo[0]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, node_left_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, node_right_ssbo);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, node_parent_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, node_level_ssbo);
     glDispatchCompute(internal_groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    // --- Bottom-up centre of mass -------------------------------------
-    propagate_shader->use();
-    propagate_shader->set_int("particleCount", n);
+    // --- Node masses, centres of mass and moments ---------------------
+    merge_shader->use();
+    merge_shader->set_int("particleCount", n);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, pos_ssbo[cur]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, mass_ssbo[cur]);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, node_left_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, node_right_ssbo);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, node_parent_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, node_level_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, node_com_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, node_aabb_ssbo);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, node_flags_ssbo);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, node_quad_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, node_quad_ssbo);
+
+    glUniform1i(merge_level_loc, -1);           // seed the leaves
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    for (int lvl = MAX_MERGE_LEVEL; lvl >= 0; lvl--) {
+        glUniform1i(merge_level_loc, lvl);
+        glDispatchCompute(internal_groups, 1, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
 
     // --- Traversal ----------------------------------------------------
     force_shader->use();
@@ -173,6 +168,7 @@ void BarnesHutGPU::buildTreeAndComputeForces() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, node_right_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, acc_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, node_quad_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, pot_ssbo);
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
@@ -190,11 +186,11 @@ void BarnesHutGPU::allocateBuffers() {
 
     GLuint* handles[] = {
         &pos_ssbo[0], &pos_ssbo[1], &vel_ssbo[0], &vel_ssbo[1],
-        &mass_ssbo[0], &mass_ssbo[1], &id_ssbo[0], &id_ssbo[1], &acc_ssbo,
+        &mass_ssbo[0], &mass_ssbo[1], &id_ssbo[0], &id_ssbo[1], &acc_ssbo, &pot_ssbo,
         &key_ssbo[0], &key_ssbo[1], &val_ssbo[0], &val_ssbo[1],
         &bounds_ssbo,
-        &node_left_ssbo, &node_right_ssbo, &node_parent_ssbo,
-        &node_com_ssbo, &node_aabb_ssbo, &node_flags_ssbo, &node_quad_ssbo,
+        &node_left_ssbo, &node_right_ssbo, &node_level_ssbo,
+        &node_com_ssbo, &node_aabb_ssbo, &node_quad_ssbo,
     };
     for (GLuint* h : handles) glGenBuffers(1, h);
 
@@ -207,14 +203,14 @@ void BarnesHutGPU::allocateBuffers() {
         allocBuffer(val_ssbo[i], uint_bytes);
     }
     allocBuffer(acc_ssbo, vec2_bytes);
+    allocBuffer(pot_ssbo, float_bytes);
     allocBuffer(bounds_ssbo, 4 * sizeof(GLuint));
 
     if (internal_count > 0) {
         allocBuffer(node_left_ssbo, GLsizeiptr(internal_count) * sizeof(GLuint));
         allocBuffer(node_right_ssbo, GLsizeiptr(internal_count) * sizeof(GLuint));
-        allocBuffer(node_flags_ssbo, GLsizeiptr(internal_count) * sizeof(GLuint));
+        allocBuffer(node_level_ssbo, GLsizeiptr(internal_count) * sizeof(GLuint));
     }
-    allocBuffer(node_parent_ssbo, GLsizeiptr(total_nodes) * sizeof(GLuint));
     allocBuffer(node_com_ssbo, GLsizeiptr(total_nodes) * sizeof(glm::vec4));
     allocBuffer(node_aabb_ssbo, GLsizeiptr(total_nodes) * sizeof(glm::vec4));
     allocBuffer(node_quad_ssbo, GLsizeiptr(total_nodes) * sizeof(glm::vec4));
@@ -225,11 +221,11 @@ void BarnesHutGPU::allocateBuffers() {
 void BarnesHutGPU::freeBuffers() {
     GLuint* handles[] = {
         &pos_ssbo[0], &pos_ssbo[1], &vel_ssbo[0], &vel_ssbo[1],
-        &mass_ssbo[0], &mass_ssbo[1], &id_ssbo[0], &id_ssbo[1], &acc_ssbo,
+        &mass_ssbo[0], &mass_ssbo[1], &id_ssbo[0], &id_ssbo[1], &acc_ssbo, &pot_ssbo,
         &key_ssbo[0], &key_ssbo[1], &val_ssbo[0], &val_ssbo[1],
         &bounds_ssbo,
-        &node_left_ssbo, &node_right_ssbo, &node_parent_ssbo,
-        &node_com_ssbo, &node_aabb_ssbo, &node_flags_ssbo, &node_quad_ssbo,
+        &node_left_ssbo, &node_right_ssbo, &node_level_ssbo,
+        &node_com_ssbo, &node_aabb_ssbo, &node_quad_ssbo,
     };
     for (GLuint* h : handles) {
         if (*h) { glDeleteBuffers(1, h); *h = 0; }
@@ -281,8 +277,6 @@ void BarnesHutGPU::syncToHost() {
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, acc_ssbo);
     glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GLsizeiptr(n) * sizeof(glm::vec2), accelerations.data());
 
-    // Particles were permuted into Morton order on device, so index i no
-    // longer refers to the particle it did at construction.
     for (int i = 0; i < n; i++) {
         particles[i].position = positions[i];
         particles[i].velocity = velocities[i];

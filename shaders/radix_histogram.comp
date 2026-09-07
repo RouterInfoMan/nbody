@@ -1,9 +1,6 @@
 #version 430 core
 
-// Pass 1 of a 4-bit LSD radix sort: per-block digit histogram.
-// Output is bin-major (hist[bin * numBlocks + block]) so that the global
-// exclusive scan in radix_scan.comp walks it contiguously and lands each
-// block's starting offset for each digit exactly where the scatter needs it.
+// 4-bit LSD radix sort on the GPU: histogram -> scan -> stable scatter.
 
 layout(local_size_x = 256) in;
 

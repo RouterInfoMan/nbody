@@ -9,17 +9,8 @@
 #include <memory>
 #include <vector>
 
-// Which analytic kernel the expansions are built for.
-//
-// Softened: the same softened inverse-square law the other solvers use
-//   (K(r) = 1/sqrt(r^2 + eps^2), a = G*grad(K)), expanded with Cartesian
-//   Taylor tensors. Kernel-agnostic and therefore directly comparable
-//   against brute force.
-//
-// Logarithmic: true 2D gravity (phi = G*m*log r, a ~ 1/r), expanded with the
-//   classic Greengard-Rokhlin complex multipoles. Far more accurate per term,
-//   but it is a DIFFERENT force law -- results will not match the other
-//   solvers, and the presets' orbital velocities are tuned for 1/r^2.
+// Softened is the same 1/r^2 law as the other solvers. Logarithmic is true
+// 2D gravity -- a DIFFERENT force law, so it will not match them.
 enum class FMMKernel {
     Softened,
     Logarithmic,
@@ -36,6 +27,11 @@ public:
 
     void step(float dt) override;
     void reset() override;
+
+    bool energyTotals(double& kinetic, double& potential) override {
+        if (kernel == FMMKernel::Logarithmic) return false;
+        return hostEnergyTotals(kinetic, potential);
+    }
     const char* name() const override {
         return kernel == FMMKernel::Softened ? "FMM (CPU, 1/r^2)"
                                              : "FMM (CPU, log)";
@@ -46,11 +42,6 @@ public:
     void setKernel(FMMKernel k) { kernel = k; rebuildTables(); }
     void setOrder(int p);
     void setDepth(int d);
-    // Cells within this many cells of a target are handled by direct
-    // summation. Raising it to 2 pushes the nearest translated pair from a
-    // 2-cell to a 3-cell separation, improving the expansion ratio from ~0.71
-    // to ~0.47 at the cost of a 25-cell near field and a 75-entry
-    // interaction list.
     void setNearFieldRadius(int ws);
     void setLeafCapacity(int cap);
 
@@ -67,13 +58,8 @@ public:
 private:
     // Morton codes are 16 bits per axis, so the tree can address 16 levels.
     static constexpr int MAX_DEPTH = 16;
-    // Coarsest level with a non-empty interaction list: below this every cell
-    // is a neighbour of every other, so there is nothing to translate.
     static constexpr int FIRST_M2L_LEVEL = 2;
 
-    // Open-addressed key -> cell index map. The interaction lists do tens of
-    // lookups per cell per level, which is far too hot for a binary search
-    // over the level's key array.
     struct CellIndex {
         static constexpr uint32_t EMPTY = 0xFFFFFFFFu;
 
@@ -126,13 +112,9 @@ private:
     float G;
     float softening;
 
-    // Morton-sorted particle state, kept as separate arrays rather than a
-    // vector<Particle>. The near-field direct sum dominates FMM cost at every
-    // useful setting, and striding it through a 36-byte struct defeats
-    // vectorisation entirely; contiguous float arrays let it use full SIMD
-    // width. Accelerations are computed here and scattered back via order_map.
     std::vector<float> pos_x, pos_y, mass;
     std::vector<float> acc_x, acc_y;
+    std::vector<float> pot;
     std::vector<uint32_t> codes;
     std::vector<int> order_map;      // sorted slot -> original particle index
     std::vector<uint64_t> sort_keys; // (morton << 32) | original index
@@ -142,13 +124,8 @@ private:
     float root_size = 1.0f;
 
     // --- Cartesian (softened) expansions -----------------------------
-    // Flat per level: [cell * stride + coefficient].
     std::vector<std::vector<double>> cart_multipole;
     std::vector<std::vector<double>> cart_local;
-    // Per level, per V-list offset: a stride x stride matrix mapping a
-    // multipole to its contribution to the target's local expansion. The
-    // translation only depends on the integer cell offset, so 40 matrices per
-    // level cover every M2L in the tree.
     std::vector<std::vector<double>> m2l_matrices;
     std::vector<int> alpha_x, alpha_y;    // exponents per flat coefficient
     std::vector<double> binomial;         // (2p+3)^2 table
@@ -164,8 +141,6 @@ private:
     void sortByMorton();
     void buildLevels();
 
-    // Every per-cell pass goes through here so the coarse levels, which hold
-    // only a handful of cells, run inline instead of paying dispatch.
     static constexpr int CELL_GRAIN = 64;
     void forEachCell(int cells, const std::function<void(int, int)>& fn) {
         pool.parallel_for(0, cells, fn, CELL_GRAIN);
@@ -199,8 +174,6 @@ private:
     // Index of the cell with `key` at `level`, or -1 if it holds no particles.
     int findCell(int level, uint32_t key) const { return levels[level].index.find(key); }
 
-    // The largest cell offset an interaction-list entry can have, and the
-    // width of the square translation table that covers it.
     int m2lReach() const { return 2 * near_radius + 1; }
     int m2lSpan() const { return 2 * m2lReach() + 1; }
 

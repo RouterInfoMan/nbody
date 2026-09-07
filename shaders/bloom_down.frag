@@ -1,8 +1,6 @@
 #version 430 core
 
-// 13-tap downsample (Jimenez, SIGGRAPH 2014). The tap pattern is stable under
-// repeated halving, which is what keeps the bloom from flickering as particles
-// move between pixels -- a plain box filter fireflies badly on a starfield.
+// 13-tap downsample (Jimenez 2014); stable under repeated halving.
 
 in vec2 uv;
 out vec4 FragColor;
@@ -16,8 +14,6 @@ uniform float knee;
 vec3 prefilter(vec3 c) {
     if (firstPass == 0) return c;
     float br = max(c.r, max(c.g, c.b));
-    // Soft knee so the bloom fades in around the threshold instead of
-    // switching on at a hard edge.
     float soft = clamp(br - threshold + knee, 0.0, 2.0 * knee);
     soft = soft * soft / (4.0 * knee + 1e-4);
     float contrib = max(soft, br - threshold) / max(br, 1e-4);

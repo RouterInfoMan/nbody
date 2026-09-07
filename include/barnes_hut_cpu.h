@@ -8,10 +8,6 @@
 #include <cstdint>
 
 namespace Morton {
-    // 16 bits per axis. The sort only exists to give the top-down build good
-    // locality -- the tree structure itself comes from geometric partitioning
-    // against cell centres -- so 65536 cells per axis is ample, and a 32-bit
-    // code halves the radix sort's work versus a 64-bit one.
     inline uint32_t expandBits(uint32_t v) {
         v &= 0x0000FFFFu;
         v = (v | (v << 8)) & 0x00FF00FFu;
@@ -52,16 +48,8 @@ struct QuadNode {
     int next = 0;
     glm::vec2 com{0.0f};
     float mass = 0.0f;
-    // Second mass moment about the centre of mass, Q_ij = sum_k m_k t_i t_j.
-    // Symmetric in 2D, so three components. Carrying it turns the multipole
-    // error from O(theta^2) into O(theta^3), which buys back far more in
-    // opening angle than the extra 12 bytes and handful of flops cost.
     float qxx = 0.0f, qxy = 0.0f, qyy = 0.0f;
-    // Distance from the cell centre to the centre of mass. The opening test
-    // measures distance to the COM but node extent from the cell centre; with
-    // the COM near a cell boundary those disagree badly enough that a source
-    // particle can be nearly as far from the COM as the target is. Requiring
-    // d > size/theta + delta closes that gap (Salmon & Warren).
+    // Cell centre to COM; the opening test needs d > size/theta + this.
     float com_offset = 0.0f;
     Quad quad;
     int body_start = 0;
@@ -80,6 +68,10 @@ public:
 
     void step(float dt) override;
     void reset() override;
+
+    bool energyTotals(double& kinetic, double& potential) override {
+        return hostEnergyTotals(kinetic, potential);
+    }
     const char* name() const override { return "Barnes-Hut (CPU)"; }
 
     void setPhysics(float g, float soft) override {
@@ -105,17 +97,12 @@ private:
 
     std::vector<uint64_t> sort_keys;   // (morton << 32) | index
     std::vector<Particle> sorted;
-    // Original index of each entry in `sorted`. The tree build partitions
-    // `sorted` in place, so this is permuted alongside it to keep the route
-    // back to `particles` valid.
     std::vector<int> sorted_ids;
 
     float theta, inv_theta;
     float G;
     float softening_sq;
     int leaf_cap;
-    // A node holding at least this many bodies is split breadth-first so the
-    // resulting subtrees can be expanded in parallel.
     int split_threshold;
     bool use_quadrupole = true;
 
@@ -136,7 +123,7 @@ private:
     void propagate();
 
     void computeForces();
-    glm::vec2 computeAcceleration(glm::vec2 pos) const;
+    glm::vec2 computeAcceleration(glm::vec2 pos, float& potential) const;
 
     void verletStep1(float dt);
     void verletStep2(float dt);

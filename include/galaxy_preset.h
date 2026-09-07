@@ -12,22 +12,12 @@ struct GalaxyParams {
     float central_mass = 10000.0f;
     float particle_mass = 0.1f;
 
-    // Surface density profile, sigma(r) ~ r^-falloff, sampled over
-    // [inner, outer]. 0 spreads mass evenly over area, 1 concentrates it
-    // toward the centre, 2 is scale-free.
     float density_falloff = 1.0f;
 
-    // Scatter applied to the circular speed, as a fraction of it. A perfectly
-    // cold disc fragments almost immediately; a few percent of dispersion is
-    // what keeps it looking like a disc.
     float velocity_dispersion = 0.02f;
 
-    // +1 prograde, -1 retrograde. Values below 1 leave the disc
-    // under-supported so it falls inward.
     float spin = 1.0f;
 
-    // Gravitational constant the orbits are balanced against. This must match
-    // the simulation's G or the disc is born out of equilibrium.
     float G = 1.0f;
 
     uint32_t seed = 42;

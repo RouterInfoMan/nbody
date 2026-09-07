@@ -6,6 +6,7 @@ layout(std430, binding = 0) buffer PositionBuffer     { vec2 positions[]; };
 layout(std430, binding = 1) buffer VelocityBuffer      { vec2 velocities[]; };
 layout(std430, binding = 2) buffer AccelerationBuffer  { vec2 accelerations[]; };
 layout(std430, binding = 3) buffer MassBuffer          { float masses[]; };
+layout(std430, binding = 4) buffer PotentialBuffer     { float potentials[]; };
 
 uniform int particleCount;
 uniform float softening;
@@ -16,16 +17,12 @@ shared vec4 tile[256]; // xy = position, z = mass
 void main() {
     uint i = gl_GlobalInvocationID.x;
 
-    // Every invocation must stay alive through the whole tile loop, even the
-    // out-of-range ones in the final partial workgroup: each is responsible
-    // for staging one entry of the shared tile, and the inner loop reads all
-    // 256 of them. Returning early left those slots uninitialised, so the
-    // last workgroup's particles summed against garbage -- and it put the
-    // barriers in non-uniform control flow, which is undefined besides.
+    // No early return: every invocation must reach the barriers below.
     bool inRange = i < uint(particleCount);
 
     vec2 myPos = inRange ? positions[i] : vec2(0.0);
     vec2 force = vec2(0.0);
+    float psi = 0.0;
 
     int numTiles = (particleCount + 255) / 256;
 
@@ -46,10 +43,15 @@ void main() {
             float invDist = inversesqrt(distSqr);
             float invDist3 = invDist * invDist * invDist;
             force += d * (tile[j].z * invDist3);
+            // Skip the self pair; it would swamp the sum near a heavy mass.
+            if (uint(t * 256 + j) != i) psi += tile[j].z * invDist;
         }
 
         barrier();
     }
 
-    if (inRange) accelerations[i] = force * G;
+    if (inRange) {
+        accelerations[i] = force * G;
+        potentials[i] = -psi * G;
+    }
 }

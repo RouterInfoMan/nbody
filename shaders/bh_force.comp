@@ -1,18 +1,6 @@
 #version 430 core
 
-// Barnes-Hut traversal over the LBVH, one thread per particle.
-//
-// Node size for the opening angle is the AABB diagonal. The longest edge is
-// the cheaper choice but it is markedly less conservative than the quadtree
-// cell width the CPU solver tests against, which made the same theta mean
-// noticeably different accuracy in the two implementations. The diagonal
-// bounds the node the way a cell width does, so theta is calibrated the same
-// way in both and the two solvers are directly comparable.
-//
-// Leaves hold exactly one particle, so a leaf's "multipole" is that particle
-// and no direct-sum inner loop is needed. A particle's own leaf contributes
-// d = 0, hence exactly zero -- the same as brute force, which also does not
-// special-case self-interaction and relies on softening.
+// Barnes-Hut traversal, one thread per particle.
 
 layout(local_size_x = 256) in;
 
@@ -23,6 +11,7 @@ layout(std430, binding = 3) readonly buffer LeftBuffer     { uint nodeLeft[]; };
 layout(std430, binding = 4) readonly buffer RightBuffer    { uint nodeRight[]; };
 layout(std430, binding = 5) writeonly buffer AccelBuffer   { vec2 accelerations[]; };
 layout(std430, binding = 6) readonly buffer QuadBuffer     { vec4 nodeQuad[]; };
+layout(std430, binding = 7) writeonly buffer PotentialBuffer { float potentials[]; };
 
 uniform int particleCount;
 uniform float invTheta;
@@ -33,19 +22,13 @@ uniform int useQuadrupole;
 const int STACK_SIZE = 64;
 
 // Multipole field of a node at offset d = com - x, to second order.
-//
-//   a = M d u^-3/2  - 3 (Qd) u^-5/2  - (3/2) tr(Q) d u^-5/2
-//                   + (15/2) d (d.Qd) u^-7/2 ,     u = |d|^2 + eps^2
-//
-// The quadrupole term turns the truncation error from O(theta^2) into
-// O(theta^3), which pays for itself many times over: the same accuracy is
-// reached at a far wider opening angle, so the traversal visits fewer nodes.
-vec2 multipole(vec2 d, float distSq, vec4 com, vec4 quad, bool withQuad) {
+vec2 multipole(vec2 d, float distSq, vec4 com, vec4 quad, bool withQuad, inout float psi) {
     float invDist = inversesqrt(max(distSq + softeningSq, 1e-20));
     float inv2 = invDist * invDist;
     float inv3 = inv2 * invDist;
 
     vec2 acc = d * (com.z * inv3);
+    psi += com.z * invDist;
 
     if (withQuad) {
         vec2 qd = vec2(quad.x * d.x + quad.y * d.y,
@@ -55,6 +38,7 @@ vec2 multipole(vec2 d, float distSq, vec4 com, vec4 quad, bool withQuad) {
         float inv5 = inv3 * inv2;
         float inv7 = inv5 * inv2;
         acc += qd * (-3.0 * inv5) + d * (-1.5 * trq * inv5 + 7.5 * dqd * inv7);
+        psi += -0.5 * trq * inv3 + 1.5 * dqd * inv5;
     }
     return acc;
 }
@@ -65,6 +49,7 @@ void main() {
 
     vec2 p = positions[gid];
     vec2 acc = vec2(0.0);
+    float psi = 0.0;
 
     int internalCount = particleCount - 1;
 
@@ -89,20 +74,17 @@ void main() {
         if (!isLeaf) {
             vec4 bb = nodeAabb[node];
             vec2 ext = bb.zw - bb.xy;
-            // Accept when d > size/theta + |com - box centre|. Distance is
-            // measured to the centre of mass but extent from the box, so
-            // without the offset term a source particle can sit almost as far
-            // from the com as the target does and the expansion diverges.
             float limit = length(ext) * invTheta + q.w;
-            // Falling back to the multipole on stack exhaustion keeps total
-            // mass exact; dropping the node instead would lose it.
             accept = (limit * limit < distSq) || (sp + 2 > STACK_SIZE);
         }
 
         if (accept) {
-            // A leaf is a single particle, so it carries no moment and the
-            // quadrupole branch is skipped for it.
-            acc += multipole(d, distSq, c, q, withQuad && !isLeaf);
+            // Skip the self leaf: it adds a spurious m/eps to the potential.
+            float ownPsi = psi;
+            bool ownLeaf = isLeaf && (node - internalCount) == int(gid);
+
+            acc += multipole(d, distSq, c, q, withQuad && !isLeaf, psi);
+            if (ownLeaf) psi = ownPsi;
         } else {
             stack[sp++] = int(nodeLeft[node]);
             stack[sp++] = int(nodeRight[node]);
@@ -110,4 +92,5 @@ void main() {
     }
 
     accelerations[gid] = acc * G;
+    potentials[gid] = -psi * G;
 }

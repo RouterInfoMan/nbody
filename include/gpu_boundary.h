@@ -4,8 +4,7 @@
 #include <GL/glew.h>
 #include <memory>
 
-// Applies a Boundary to device-resident particle state. Shared by both GPU
-// solvers so there is exactly one copy of the dispatch.
+// Applies a Boundary to device-resident state.
 class GpuBoundary {
 public:
     GpuBoundary() = default;
@@ -17,8 +16,6 @@ public:
                const Boundary& boundary, float dt) {
         if (!boundary.active() || count <= 0 || !pos_ssbo || !vel_ssbo) return;
 
-        // Built on first use: solvers that never see an active boundary do not
-        // pay for compiling it.
         if (!shader) shader = std::make_unique<Shader>("shaders/boundary.comp");
 
         shader->use();

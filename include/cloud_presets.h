@@ -4,13 +4,7 @@
 #include <random>
 
 // Self-gravitating blobs held up by velocity dispersion rather than rotation.
-// There is no pressure in an N-body code, so random motion is what stands in
-// for it: `support` near 1 makes a cloud roughly virialised and long-lived,
-// and 0 drops it into free-fall collapse.
 struct CloudParams {
-    // Plummer scale is radius/3, truncated at radius, which gives a smooth
-    // centrally concentrated blob with a definite edge rather than the hard
-    // rim of a uniform disc.
     float radius = 30.0f;
     float support = 1.0f;
 };
@@ -25,9 +19,6 @@ struct BinaryCloudsParams {
     // Mass of the second cloud relative to the first.
     float mass_ratio = 1.0f;
 
-    // Fraction of the circular-orbit speed. 0 is a head-on free fall, 1 is a
-    // circular orbit, and values between put the pair on an eccentric one
-    // that grazes and tidally shreds before merging.
     float orbit_fraction = 1.0f;
     float support = 1.0f;
 
@@ -77,8 +68,6 @@ private:
 
 namespace clouds {
 
-// Appends one Plummer cloud of `n` particles totalling `mass`, centred on
-// `center` and drifting at `bulk`.
 void emit(std::vector<Particle>& out, std::mt19937& gen, int n,
           glm::vec2 center, glm::vec2 bulk, float mass,
           const CloudParams& shape, float G);

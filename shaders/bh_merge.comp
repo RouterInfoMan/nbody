@@ -1,0 +1,58 @@
+#version 430 core
+
+// One dispatch per level; ordering within a single dispatch is not reliable.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PositionBuffer { vec2 positions[]; };
+layout(std430, binding = 1) readonly buffer MassBuffer     { float masses[]; };
+layout(std430, binding = 2) readonly buffer LeftBuffer     { uint nodeLeft[]; };
+layout(std430, binding = 3) readonly buffer RightBuffer    { uint nodeRight[]; };
+layout(std430, binding = 4) readonly buffer LevelBuffer    { uint nodeLevel[]; };
+layout(std430, binding = 5) buffer ComBuffer               { vec4 nodeCom[]; };
+layout(std430, binding = 6) buffer AabbBuffer              { vec4 nodeAabb[]; };
+layout(std430, binding = 7) buffer QuadBuffer              { vec4 nodeQuad[]; };
+
+uniform int particleCount;
+uniform int level;        // -1 seeds the leaves, otherwise merge this level
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint internalCount = uint(particleCount - 1);
+
+    if (level < 0) {
+        // Leaves hold one particle: no spread, so no second moment.
+        if (i >= uint(particleCount)) return;
+        uint leaf = internalCount + i;
+        vec2 p = positions[i];
+        nodeCom[leaf] = vec4(p, masses[i], 0.0);
+        nodeAabb[leaf] = vec4(p, p);
+        nodeQuad[leaf] = vec4(0.0);
+        return;
+    }
+
+    if (i >= internalCount || nodeLevel[i] != uint(level)) return;
+
+    uint l = nodeLeft[i];
+    uint r = nodeRight[i];
+
+    vec4 cl = nodeCom[l];
+    vec4 cr = nodeCom[r];
+    float total = cl.z + cr.z;
+    vec2 com = (total > 0.0) ? (cl.xy * cl.z + cr.xy * cr.z) / total
+                             : 0.5 * (cl.xy + cr.xy);
+    nodeCom[i] = vec4(com, total, 0.0);
+
+    vec4 al = nodeAabb[l];
+    vec4 ar = nodeAabb[r];
+    vec4 box = vec4(min(al.xy, ar.xy), max(al.zw, ar.zw));
+    nodeAabb[i] = box;
+
+    vec2 sl = cl.xy - com;
+    vec2 sr = cr.xy - com;
+    vec3 ql = nodeQuad[l].xyz + cl.z * vec3(sl.x * sl.x, sl.x * sl.y, sl.y * sl.y);
+    vec3 qr = nodeQuad[r].xyz + cr.z * vec3(sr.x * sr.x, sr.x * sr.y, sr.y * sr.y);
+
+    float offset = length(com - 0.5 * (box.xy + box.zw));
+    nodeQuad[i] = vec4(ql + qr, offset);
+}

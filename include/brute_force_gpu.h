@@ -2,6 +2,7 @@
 #include "simulation.h"
 #include "preset.h"
 #include "shader.h"
+#include "gpu_energy.h"
 #include "gpu_boundary.h"
 #include <GL/glew.h>
 #include <memory>
@@ -21,6 +22,11 @@ public:
     GLuint massBuffer() const override { return mass_ssbo; }
     void syncToHost() override;
 
+    bool energyTotals(double& kinetic, double& potential) override {
+        return gpu_energy.totals(vel_ssbo, mass_ssbo, pot_ssbo,
+                                 getParticleCount(), kinetic, potential);
+    }
+
 private:
     GpuBoundary gpu_boundary;
     std::unique_ptr<Preset> preset;
@@ -35,6 +41,8 @@ private:
     GLuint vel_ssbo = 0;
     GLuint acc_ssbo = 0;
     GLuint mass_ssbo = 0;
+    GLuint pot_ssbo = 0;
+    GpuEnergy gpu_energy;
     int gpu_particle_count = 0;
 
     static constexpr int WORKGROUP_SIZE = 256;

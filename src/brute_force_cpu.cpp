@@ -10,6 +10,8 @@ void BruteForceCPU::reset() {
     current_time = 0.0f;
     preset->apply(particles);
     setParticleCount(static_cast<int>(particles.size()));
+
+    if (!particles.empty()) computeForces();
 }
 
 void BruteForceCPU::step(float dt) {
@@ -31,17 +33,21 @@ void BruteForceCPU::computeForces() {
     pool.parallel_for(0, n, [&](int start, int end) {
         for (int i = start; i < end; i++) {
             glm::vec2 acc(0.0f);
+            float pot = 0.0f;
             glm::vec2 pi = particles[i].position;
 
             for (int j = 0; j < n; j++) {
+                if (j == i) continue;
                 glm::vec2 d = particles[j].position - pi;
                 float dist_sq = glm::dot(d, d) + softening_sq;
                 float inv_dist = 1.0f / std::sqrt(dist_sq);
                 float inv_dist3 = inv_dist * inv_dist * inv_dist;
                 acc += d * (particles[j].mass * inv_dist3);
+                pot -= particles[j].mass * inv_dist;
             }
 
             particles[i].acceleration = acc * G;
+            particles[i].potential = pot * G;
         }
     });
 }

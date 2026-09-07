@@ -1,8 +1,6 @@
 #version 430 core
 
-// 3x3 tent upsample, written with additive blending so each mip accumulates
-// into the one above it. Progressive upsampling like this gives a wide, smooth
-// glow far more cheaply than one large-radius blur.
+// 3x3 tent upsample, additive so each mip accumulates into the one above.
 
 in vec2 uv;
 out vec4 FragColor;

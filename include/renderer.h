@@ -14,13 +14,7 @@ enum ColorMode {
     COLOR_MODE_COUNT
 };
 
-// HDR particle renderer.
-//
-// Particles accumulate additively into a floating-point target, so overlapping
-// sprites sum past 1.0 rather than saturating at it. A progressive bloom chain
-// then spreads the over-bright regions and a filmic curve maps the result back
-// into display range. That ordering is what makes a dense core read as a glow
-// with structure instead of a flat white disc.
+// HDR renderer: additive sprites -> bloom chain -> filmic tone map.
 class Renderer {
 public:
     Renderer();
@@ -34,19 +28,12 @@ public:
 
     void render(const std::vector<Particle>& particles, const Camera2D& camera, bool force_update);
 
-    // Draws straight out of a solver's device buffers: no readback, no upload.
-    // pos/vel are std430 vec2 arrays; mass may be 0 if the solver has none.
     void renderFromGPU(GLuint pos_ssbo, GLuint vel_ssbo, GLuint mass_ssbo,
                        GLuint id_ssbo, int count, const Camera2D& camera);
 
-    // Overlays the acceleration structure. Call after render()/renderFromGPU()
-    // -- it draws to the default framebuffer on top of the tone-mapped image,
-    // deliberately outside the HDR path so the lines stay crisp and do not bloom.
     void drawTreeOverlay(GLuint box_ssbo, int box_count, const Camera2D& camera,
                          int max_depth, float alpha);
 
-    // Outlines the containment wall. Like the tree overlay, drawn after tone
-    // mapping so it stays crisp.
     void drawBoundary(const Camera2D& camera, int shape, float radius, float alpha);
 
     void setParticleSize(float size) { particle_size = size; needs_update = true; }
@@ -54,14 +41,8 @@ public:
 
     void setColorMode(int mode) { color_mode = mode; needs_update = true; }
     void setTemperatureRange(float low, float high) { temp_low = low; temp_high = high; needs_update = true; }
-    // Window, in the same units as the selected scalar, that the temperature
-    // ramp spans. Calibrate it from the data with calibrateRange().
     void setRange(float low, float high) { range_lo = low; range_hi = high; needs_update = true; }
-    // Picks a robust window from the 5th/95th percentile of the current
-    // scalar, so the ramp spans what is actually present rather than a guess.
     void calibrateRange(const std::vector<Particle>& particles);
-    // Same, for GPU-resident solvers. Reads back only the one buffer the
-    // ramp depends on rather than stalling on a full syncToHost.
     void calibrateRangeFromGPU(GLuint vel_ssbo, GLuint mass_buf, int count);
     void setIntensity(float i) { intensity = i; needs_update = true; }
     void setExposure(float e) { exposure = e; }
@@ -140,8 +121,6 @@ private:
     bool needs_update = true;
 
     static constexpr int MAX_BLOOM_MIPS = 6;
-    // Cap on boxes the overlay will draw in one frame. Well past what stays
-    // readable, and it bounds the compacted buffer at a few megabytes.
     static constexpr int TREE_BOX_CAPACITY = 1 << 18;
 
     void setupBuffers();

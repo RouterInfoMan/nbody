@@ -1,0 +1,36 @@
+#version 430 core
+
+// Reduces energy to one partial per workgroup; the host sums them.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer VelocityBuffer  { vec2 velocities[]; };
+layout(std430, binding = 1) readonly buffer MassBuffer      { float masses[]; };
+layout(std430, binding = 2) readonly buffer PotentialBuffer { float potentials[]; };
+layout(std430, binding = 3) writeonly buffer PartialBuffer  { vec2 partials[]; };
+
+uniform int particleCount;
+
+shared vec2 s_acc[256];
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    uint l = gl_LocalInvocationID.x;
+
+    vec2 v = vec2(0.0);
+    if (i < uint(particleCount)) {
+        float m = masses[i];
+        // Half the potential term: each pair contributes to both of its ends.
+        v = vec2(0.5 * m * dot(velocities[i], velocities[i]),
+                 0.5 * m * potentials[i]);
+    }
+    s_acc[l] = v;
+    barrier();
+
+    for (uint off = 128u; off > 0u; off >>= 1) {
+        if (l < off) s_acc[l] += s_acc[l + off];
+        barrier();
+    }
+
+    if (l == 0u) partials[gl_WorkGroupID.x] = s_acc[0];
+}

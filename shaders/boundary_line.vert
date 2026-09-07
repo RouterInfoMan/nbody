@@ -1,8 +1,6 @@
 #version 430 core
 
-// Draws the containment wall as a line loop, generated from gl_VertexID so it
-// needs no buffers. An invisible wall is confusing, and it also shows at a
-// glance whether the simulation has grown past it.
+// Draws the containment wall as a line loop from gl_VertexID.
 
 uniform mat4 projection;
 uniform int shape;        // 0 circle, 1 box

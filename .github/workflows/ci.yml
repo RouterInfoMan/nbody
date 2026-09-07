@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux build + CPU checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake \
+            libglfw3-dev libglew-dev libglm-dev libgl-dev
+
+      # NATIVE_ARCH off: the runner's CPU is not the one anybody will run on,
+      # and -march=native would make the build machine-specific for no gain.
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNBODY_NATIVE_ARCH=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      # Runners have no GPU, so the OpenGL-backed checks are skipped. The CPU
+      # solvers, presets, energy conservation and FMM convergence all still run
+      # against a direct N-body sum.
+      - name: Solver checks
+        working-directory: build
+        run: ./solver_check --no-gpu
+
+  windows-cross:
+    name: Windows cross-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++-mingw-w64-x86-64
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-win \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-mingw64.cmake \
+            -DCMAKE_BUILD_TYPE=Release -DNBODY_NATIVE_ARCH=OFF
+
+      - name: Build
+        run: cmake --build build-win -j"$(nproc)"
+
+      # The whole point of the Windows build is that it needs nothing beside
+      # it, so assert that rather than trusting the link flags stayed put.
+      - name: Verify the binary is self-contained
+        run: |
+          deps=$(x86_64-w64-mingw32-objdump -p build-win/nbody.exe \
+                 | awk '/DLL Name/ {print $3}' | sort -u)
+          echo "$deps"
+          if echo "$deps" | grep -qiE 'libstdc|libgcc|libwinpthread|glfw|glew'; then
+            echo "::error::nbody.exe depends on a non-system DLL"
+            exit 1
+          fi
+
+  shaders:
+    name: GLSL validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools
+
+      # Catches the class of mistake that otherwise only shows up at runtime on
+      # a machine with a GPU -- a reserved word used as an identifier, say.
+      - name: Validate every shader
+        run: |
+          status=0
+          for f in shaders/*.vert shaders/*.frag shaders/*.comp; do
+            if glslangValidator "$f" > /tmp/out 2>&1; then
+              echo "ok   $f"
+            else
+              echo "FAIL $f"
+              cat /tmp/out
+              status=1
+            fi
+          done
+          exit $status

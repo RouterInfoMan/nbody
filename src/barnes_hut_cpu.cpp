@@ -21,8 +21,6 @@ bool BarnesHutCPU::treeGeometry(GLuint& buffer, int& count) {
     tree_boxes.clear();
     tree_boxes.reserve(size_t(live));
 
-    // The root is index 0 and always occupied, so it lands first -- which the
-    // collector relies on to establish the depth scale.
     for (int i = 0; i < live; i++) {
         const QuadNode& nd = nodes[i];
         if (nd.mass <= 0.0f) continue;   // subdivision produces empty children
@@ -58,9 +56,6 @@ void BarnesHutCPU::reset() {
     nodes.resize(estimated);
     parent_map.resize(estimated / 4 + 1);
 
-    // Seed the tree and the accelerations. Verlet's first drift needs a(0) to
-    // be right, and it also means the tree exists for the debug overlay before
-    // the simulation has been stepped. The GPU solver already did this.
     if (n > 0) {
         sortByMorton();
         buildTree();
@@ -154,8 +149,6 @@ int BarnesHutCPU::subdivide(int node_idx, int range_start, int range_end) {
     const int idx = node_count.fetch_add(1, std::memory_order_relaxed);
     const int children = idx * 4 + 1;
 
-    // Subtrees are expanded concurrently, so the node pool cannot be grown
-    // here. Overflow is recorded and buildTree retries with a bigger pool.
     if (static_cast<size_t>(children + 3) >= nodes.size()) {
         node_overflow.store(true, std::memory_order_relaxed);
         return -1;
@@ -236,9 +229,6 @@ void BarnesHutCPU::expandSubtree(int root_node) {
 void BarnesHutCPU::propagate() {
     const int len = node_count.load(std::memory_order_relaxed);
 
-    // parent_map is filled in subdivision order, and a node is always
-    // subdivided before its children are, so walking it backwards visits every
-    // child before its parent.
     for (int idx = len - 1; idx >= 0; idx--) {
         const int node = parent_map[idx];
         const int c = nodes[node].children;
@@ -254,8 +244,6 @@ void BarnesHutCPU::propagate() {
         nodes[node].com = com;
         nodes[node].mass = mass;
 
-        // Parallel axis theorem: shifting each child's second moment from its
-        // own centre of mass to the parent's.
         float qxx = 0.0f, qxy = 0.0f, qyy = 0.0f;
         for (int k = 0; k < 4; k++) {
             const QuadNode& ch = nodes[c + k];
@@ -283,8 +271,6 @@ void BarnesHutCPU::buildTree() {
     frontier.reserve(1024);
     next_frontier.reserve(1024);
 
-    // The parallel phase cannot grow the node pool, so on overflow the whole
-    // build restarts against a larger one. In steady state this never fires.
     for (int attempt = 0; attempt < 8; attempt++) {
         clearTree();
 
@@ -297,8 +283,6 @@ void BarnesHutCPU::buildTree() {
         frontier.clear();
         frontier.push_back(ROOT);
 
-        // Split breadth-first while nodes are large, to expose enough
-        // independent subtrees to keep every worker busy.
         const size_t target_tasks = size_t(pool.size()) * 4;
         bool overflowed = false;
 
@@ -346,8 +330,9 @@ void BarnesHutCPU::buildTree() {
     }
 }
 
-glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos) const {
+glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos, float& potential) const {
     glm::vec2 acc(0.0f);
+    float psi = 0.0f;
     int node = ROOT;
 
     while (true) {
@@ -355,8 +340,6 @@ glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos) const {
         const glm::vec2 d = n.com - pos;
         const float d_sq = glm::dot(d, d);
 
-        // Accept when d > size/theta + |com - cell centre|, squared to keep
-        // the traversal free of square roots.
         const float limit = n.quad.size * inv_theta + n.com_offset;
         const bool accept = limit * limit < d_sq;
 
@@ -368,10 +351,9 @@ glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos) const {
                     const float inv2 = inv * inv;
                     const float inv3 = inv2 * inv;
                     acc += d * (n.mass * inv3);
+                    psi += n.mass * inv;
 
                     if (use_quadrupole) {
-                        // a += G[ -3 (Qd) u^-5/2 - (3/2) tr(Q) d u^-5/2
-                        //         + (15/2) d (d.Qd) u^-7/2 ]
                         const glm::vec2 qd(n.qxx * d.x + n.qxy * d.y,
                                            n.qxy * d.x + n.qyy * d.y);
                         const float dqd = d.x * qd.x + d.y * qd.y;
@@ -380,6 +362,7 @@ glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos) const {
                         const float inv7 = inv5 * inv2;
                         acc += qd * (-3.0f * inv5)
                              + d * (-1.5f * trq * inv5 + 7.5f * dqd * inv7);
+                        psi += -0.5f * trq * inv3 + 1.5f * dqd * inv5;
                     }
                 }
             } else {
@@ -388,6 +371,7 @@ glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos) const {
                     const float bd_sq = glm::dot(bd, bd) + softening_sq;
                     const float inv = 1.0f / std::sqrt(bd_sq);
                     acc += bd * (sorted[i].mass * inv * inv * inv);
+                    if (bd_sq > softening_sq * 1.0000001f) psi += sorted[i].mass * inv;
                 }
             }
             if (n.next == 0) break;
@@ -397,17 +381,20 @@ glm::vec2 BarnesHutCPU::computeAcceleration(glm::vec2 pos) const {
         }
     }
 
+    potential = -psi * G;
     return acc * G;
 }
 
 void BarnesHutCPU::computeForces() {
     const int n = static_cast<int>(particles.size());
 
-    // Forces are evaluated at the Morton-sorted positions, where traversals of
-    // neighbouring indices touch the same nodes, then scattered back.
     pool.parallel_for(0, n, [&](int start, int end) {
-        for (int i = start; i < end; i++)
-            particles[sorted_ids[i]].acceleration = computeAcceleration(sorted[i].position);
+        for (int i = start; i < end; i++) {
+            float pot = 0.0f;
+            const glm::vec2 a = computeAcceleration(sorted[i].position, pot);
+            particles[sorted_ids[i]].acceleration = a;
+            particles[sorted_ids[i]].potential = pot;
+        }
     });
 }
 

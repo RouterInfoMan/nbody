@@ -1,15 +1,6 @@
 #version 430 core
 
 // Pass 3: stable scatter of one 4-bit digit.
-//
-// Each thread owns a contiguous run of 8 items, so ordering by (thread id,
-// item index) is the original input order -- that is what makes this pass
-// stable, which LSD radix sort requires.
-//
-// Destination of an element = (global offset of this block's run of that
-// digit, from the scanned histogram)
-//           + (rank of this thread's items of that digit within the block)
-//           + (how many earlier items this thread holds with that digit).
 
 layout(local_size_x = 256) in;
 
@@ -28,8 +19,6 @@ const uint BLOCK_SIZE = 2048u;
 const uint RADIX = 16u;
 const uint THREADS = 256u;
 
-// Bin-major: s_counts[bin * THREADS + tid]. Only thread `tid` touches its own
-// column, so the accumulation below needs no atomics.
 shared uint s_counts[4096];   // RADIX * THREADS
 shared uint s_partial[256];   // THREADS
 shared uint s_binBase[16];    // RADIX
@@ -64,9 +53,6 @@ void main() {
     }
     barrier();
 
-    // Exclusive scan of the full 4096-entry bin-major table. Each thread
-    // serially folds its own 16 contiguous entries, the 256 partials are
-    // scanned in shared memory, then the result is written back in place.
     uint sum = 0u;
     for (uint j = 0u; j < RADIX; j++)
         sum += s_counts[lid * RADIX + j];
@@ -92,8 +78,6 @@ void main() {
     }
     barrier();
 
-    // s_counts[bin * THREADS + 0] is now the number of block elements in
-    // strictly lower bins, i.e. where this bin's run starts within the block.
     if (lid < RADIX)
         s_binBase[lid] = s_counts[lid * THREADS];
     barrier();

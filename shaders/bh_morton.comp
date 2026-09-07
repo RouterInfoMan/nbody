@@ -1,8 +1,6 @@
 #version 430 core
 
-// 32-bit 2D Morton codes (16 bits per axis) plus the identity permutation.
-// Bounds come straight from bh_bounds.comp's SSBO, so the host never stalls
-// on a readback to set up the sort.
+// 32-bit 2D Morton codes plus the identity permutation.
 
 layout(local_size_x = 256) in;
 

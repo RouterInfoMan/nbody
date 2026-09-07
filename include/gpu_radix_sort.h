@@ -3,10 +3,7 @@
 #include <GL/glew.h>
 #include <memory>
 
-// 4-bit LSD radix sort over 32-bit keys with a uint payload, entirely on the
-// GPU. Eight passes of histogram -> global scan -> stable scatter; because the
-// pass count is even the sorted result lands back in the caller's original
-// buffers and the temporaries are left holding scratch.
+// 4-bit LSD radix sort on the GPU: histogram -> scan -> stable scatter.
 class GpuRadixSort {
 public:
     static constexpr int RADIX_BITS = 4;
@@ -22,9 +19,6 @@ public:
     GpuRadixSort(const GpuRadixSort&) = delete;
     GpuRadixSort& operator=(const GpuRadixSort&) = delete;
 
-    // Sorts `count` key/value pairs. On return `keys` and `values` hold the
-    // sorted sequence; `keys_tmp` and `values_tmp` must be buffers of the same
-    // size and are clobbered.
     void sort(GLuint keys, GLuint values, GLuint keys_tmp, GLuint values_tmp, int count);
 
     static int blockCount(int count) { return (count + BLOCK_SIZE - 1) / BLOCK_SIZE; }

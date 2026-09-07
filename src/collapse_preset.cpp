@@ -41,8 +41,6 @@ void CollapsePreset::apply(std::vector<Particle>& particles) {
 
         glm::vec2 vel(0.0f);
         if (needs_speed && r > 1e-6f) {
-            // Uniform surface density means the enclosed fraction is exactly
-            // the deviate that produced r.
             const float enclosed = params.central_mass + total_mass * u;
             const float v_circ = std::sqrt(params.G * enclosed / r);
 

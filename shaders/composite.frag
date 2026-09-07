@@ -1,8 +1,5 @@
 #version 430 core
 
-// Combines the HDR scene with the bloom chain, applies exposure and a filmic
-// tone curve, and writes sRGB.
-
 in vec2 uv;
 out vec4 FragColor;
 
@@ -29,12 +26,7 @@ vec3 acesPerChannel(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// Applying a tone curve per channel compresses the largest channel hardest,
-// which drags every bright pixel toward white -- and with additive particle
-// blending almost the whole image is bright, so the scene loses most of its
-// colour exactly where there is most of it. Tone mapping luminance alone and
-// rescaling chroma keeps hue and saturation intact but can push channels out
-// of gamut, so the two are blended.
+// Per-channel tone mapping desaturates; blend in a luminance-only curve.
 vec3 toneMap(vec3 c) {
     vec3 perChannel = acesPerChannel(c);
 
@@ -50,8 +42,6 @@ void main() {
 
     color *= exposure;
 
-    // Saturation is applied in linear HDR, before the tone curve, so the
-    // curve sees the intended colour rather than correcting a clipped one.
     if (saturation != 1.0) {
         float l = luminance(color);
         color = max(mix(vec3(l), color, saturation), vec3(0.0));

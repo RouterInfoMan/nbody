@@ -10,10 +10,6 @@ public:
     void zoom(float factor);
     void setScreenSize(float width, float height);
 
-    // Frames a disc of this radius and makes it what reset() returns to.
-    // Scene scale is a preset parameter now and spans orders of magnitude, so
-    // a fixed default zoom would leave most configurations off screen.
-    // `recenter` false records the new home without moving the current view.
     void setHomeRadius(float radius, bool recenter = true);
     void reset();
 

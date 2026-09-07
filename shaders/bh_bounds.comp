@@ -1,8 +1,6 @@
 #version 430 core
 
-// Parallel AABB reduction over all particle positions.
-// Floats are mapped to an order-preserving uint key so atomicMin/atomicMax
-// (which GLSL only provides for integers) reproduce float ordering exactly.
+// Parallel AABB reduction; floats mapped to order-preserving uint keys.
 
 layout(local_size_x = 256) in;
 

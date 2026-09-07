@@ -31,9 +31,6 @@ void GalaxyPreset::apply(std::vector<Particle>& particles) {
     if (params.central_mass > 0.0f)
         particles.emplace_back(glm::vec2(0.0f), glm::vec2(0.0f), params.central_mass);
 
-    // Inverse-CDF sampling of sigma(r) ~ r^-falloff. With q = 2 - falloff the
-    // enclosed-count fraction is exactly the uniform deviate that produced r,
-    // which is also what the enclosed disc mass below needs.
     const float q = 2.0f - params.density_falloff;
     const bool scale_free = std::abs(q) < 1e-4f;
     const float inner_q = scale_free ? 0.0f : std::pow(inner, q);
@@ -49,9 +46,6 @@ void GalaxyPreset::apply(std::vector<Particle>& particles) {
         const float angle = angle_dist(gen);
         const glm::vec2 pos(r * std::cos(angle), r * std::sin(angle));
 
-        // Balance against everything interior: the central mass plus the disc
-        // inside this radius. Using the central mass alone leaves the outer
-        // disc badly under-supported once it carries comparable mass.
         const float enclosed = params.central_mass + disc_mass * u;
         const float v_circ = std::sqrt(params.G * enclosed / r);
         const float speed = v_circ * params.spin

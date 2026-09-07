@@ -2,8 +2,6 @@
 #include <cmath>
 #include <glm/glm.hpp>
 
-// Optional containment applied after each integration step, so the system can
-// be held together instead of slowly evaporating as escapers fly off.
 enum BoundaryMode {
     BOUNDARY_OFF = 0,
     BOUNDARY_BOUNCE,   // hard wall: reflect the outward velocity component
@@ -24,21 +22,14 @@ struct Boundary {
     // Circle radius, or box half-extent.
     float radius = 600.0f;
 
-    // Fraction of the normal velocity kept on impact. 1 is perfectly elastic,
-    // 0 makes the wall completely absorbing.
     float restitution = 0.6f;
 
-    // Damping rate outside the wall, per unit time, scaled by how far out the
-    // particle is. Zero at the wall itself so nothing discontinuous happens
-    // to particles skimming it.
     float drag = 4.0f;
 
     bool active() const { return mode != BOUNDARY_OFF; }
 };
 
-// Kept in one place because shaders/boundary.comp mirrors it exactly; the CPU
-// and GPU solvers have to agree or switching algorithms would change the
-// physics.
+// Mirrored in shaders/boundary.comp -- keep the two in sync.
 inline void applyBoundary(glm::vec2& pos, glm::vec2& vel, const Boundary& b, float dt) {
     if (b.mode == BOUNDARY_OFF || b.radius <= 0.0f) return;
 
@@ -50,9 +41,7 @@ inline void applyBoundary(glm::vec2& pos, glm::vec2& vel, const Boundary& b, flo
 
         const glm::vec2 n = pos / r;
         if (b.mode == BOUNDARY_BOUNCE) {
-            // Clamp just inside rather than mirroring the overshoot: a
-            // particle that crossed by more than the wall radius in one step
-            // would otherwise be reflected past the centre.
+            // Clamp rather than mirror, so a big overshoot cannot cross the centre.
             pos = n * (R * 0.999f);
             const float vn = glm::dot(vel, n);
             if (vn > 0.0f) vel -= (1.0f + b.restitution) * vn * n;

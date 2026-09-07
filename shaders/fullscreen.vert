@@ -1,7 +1,6 @@
 #version 430 core
 
-// Single oversized triangle covering the viewport; needs no vertex buffer,
-// just a bound (empty) VAO and glDrawArrays(GL_TRIANGLES, 0, 3).
+// Fullscreen triangle from gl_VertexID; no vertex buffer needed.
 
 out vec2 uv;
 

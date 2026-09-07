@@ -34,6 +34,7 @@ void BruteForceGPU::reset() {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, vel_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, acc_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, mass_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, pot_ssbo);
     glDispatchCompute(groups, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 }
@@ -46,6 +47,7 @@ void BruteForceGPU::step(float dt) {
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, vel_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, acc_ssbo);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, mass_ssbo);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, pot_ssbo);
 
     verlet1_shader->use();
     verlet1_shader->set_int("particleCount", n);
@@ -78,6 +80,7 @@ void BruteForceGPU::allocateBuffers() {
     glGenBuffers(1, &vel_ssbo);
     glGenBuffers(1, &acc_ssbo);
     glGenBuffers(1, &mass_ssbo);
+    glGenBuffers(1, &pot_ssbo);
 }
 
 void BruteForceGPU::freeBuffers() {
@@ -85,6 +88,7 @@ void BruteForceGPU::freeBuffers() {
     if (vel_ssbo)  { glDeleteBuffers(1, &vel_ssbo);  vel_ssbo = 0; }
     if (acc_ssbo)  { glDeleteBuffers(1, &acc_ssbo);  acc_ssbo = 0; }
     if (mass_ssbo) { glDeleteBuffers(1, &mass_ssbo); mass_ssbo = 0; }
+    if (pot_ssbo)  { glDeleteBuffers(1, &pot_ssbo);  pot_ssbo = 0; }
 }
 
 void BruteForceGPU::uploadToGPU() {
@@ -110,6 +114,9 @@ void BruteForceGPU::uploadToGPU() {
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, mass_ssbo);
     glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(float), masses.data(), GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, pot_ssbo);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, n * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
 }
 
 void BruteForceGPU::syncToHost() {

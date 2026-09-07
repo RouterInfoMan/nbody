@@ -1,8 +1,4 @@
-// Accuracy-versus-cost sweeps used to pick defaults for the tree solvers.
-//
-// Prints, for each configuration, the standard normalised force error next to
-// the measured cost per step, so the two can be traded off directly rather
-// than argued about. Run from the build directory.
+// Accuracy-versus-cost sweeps used to pick solver defaults.
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>

@@ -1,7 +1,6 @@
 #version 430 core
 
-// Draws box outlines straight out of an SSBO: no vertex buffer, no index
-// buffer. Eight vertices per box trace its four edges.
+// Draws box outlines from an SSBO; 8 vertices per box, no vertex buffer.
 
 layout(std430, binding = 0) readonly buffer BoxBuffer { vec4 boxes[]; };
 layout(std430, binding = 1) readonly buffer DrawCmd   { uint cmd[]; };
@@ -16,8 +15,6 @@ void main() {
     uint v = uint(gl_VertexID) & 7u;
 
     if (node >= uint(capacity)) {
-        // The collector counts every visible box but only stores what fits, so
-        // the tail of an overflowing draw is pushed outside clip space.
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         vShade = 0.0;
         return;
@@ -34,8 +31,6 @@ void main() {
 
     gl_Position = projection * vec4(p, 0.0, 1.0);
 
-    // Smaller cells are deeper; fading them keeps the coarse structure legible
-    // instead of drowning it in the finest level.
     float rootE = uintBitsToFloat(cmd[4]);
     float rel = max(hi.x - lo.x, hi.y - lo.y) / max(rootE, 1e-6);
     vShade = clamp(0.35 + 0.65 * pow(rel, 0.35), 0.0, 1.0);

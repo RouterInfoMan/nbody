@@ -10,6 +10,10 @@ public:
 
     void step(float dt) override;
     void reset() override;
+
+    bool energyTotals(double& kinetic, double& potential) override {
+        return hostEnergyTotals(kinetic, potential);
+    }
     const char* name() const override { return "Brute Force (CPU)"; }
 
 private:

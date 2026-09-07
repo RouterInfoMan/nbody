@@ -72,8 +72,6 @@ void Renderer::createTargets(int width, int height) {
     fb_width = std::max(1, width);
     fb_height = std::max(1, height);
 
-    // RGBA16F: particle emission routinely sums well past 1.0 and the bloom
-    // pass needs that headroom to have anything to work with.
     glGenTextures(1, &hdr_tex);
     glBindTexture(GL_TEXTURE_2D, hdr_tex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, fb_width, fb_height, 0, GL_RGBA, GL_FLOAT, nullptr);
@@ -102,8 +100,6 @@ void Renderer::createTargets(int width, int height) {
         glTexImage2D(GL_TEXTURE_2D, 0, GL_R11F_G11F_B10F, w, h, 0, GL_RGB, GL_FLOAT, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        // Clamping matters: the tent filter samples outside the mip at the
-        // edges, and wrapping would smear the opposite side of the screen in.
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
@@ -145,8 +141,6 @@ void Renderer::ensureVertexCapacity(size_t count) {
 void Renderer::setRangeFromSample(std::vector<float>& sample) {
     if (sample.empty()) return;
 
-    // Percentiles rather than min/max: a single escaping particle at a huge
-    // speed would otherwise squash the entire visible range into one colour.
     std::sort(sample.begin(), sample.end());
     const size_t lo_i = size_t(double(sample.size() - 1) * 0.05);
     const size_t hi_i = size_t(double(sample.size() - 1) * 0.95);
@@ -154,8 +148,6 @@ void Renderer::setRangeFromSample(std::vector<float>& sample) {
     const float lo = sample[lo_i];
     const float hi = std::max(sample[hi_i], lo * 1.05f + 1e-3f);
 
-    // Ease toward the new window. A self-gravitating system heats in bursts,
-    // and snapping the ramp makes the whole field change colour at once.
     if (range_hi > 0.0f) {
         const float k = 0.25f;
         range_lo += (lo - range_lo) * k;
@@ -246,8 +238,6 @@ void Renderer::shadeIntoVertexBuffer(GLuint pos, GLuint vel, GLuint mass, GLuint
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, pos);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, vel);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, particle_vbo);
-        // The shader only reads this when hasMass is set, but a binding must
-        // still be present for the buffer block to be valid.
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, mass ? mass : pos);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ids ? ids : pos);
     } else {
@@ -268,8 +258,6 @@ void Renderer::beginScene() {
     glClearColor(0.004f, 0.006f, 0.014f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
-    // Additive: overlapping sprites sum instead of occluding, which is what
-    // turns particle density into brightness.
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE);
 }
@@ -364,8 +352,6 @@ void Renderer::endScene() {
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, hdr_tex);
     glActiveTexture(GL_TEXTURE1);
-    // With bloom off the shader still samples the slot, so point it at
-    // something valid and scale its contribution to zero above.
     glBindTexture(GL_TEXTURE_2D, bloom_mips.empty() ? hdr_tex : bloom_mips[0].tex);
 
     drawFullscreen();
@@ -440,8 +426,6 @@ void Renderer::render(const std::vector<Particle>& particles, const Camera2D& ca
 
     if (force_update || needs_update || particles.size() != last_particle_count) {
         uploadParticles(particles);
-        // Host-side solvers keep `particles` in a stable order, so array
-        // position is already a valid identity and needs no id buffer.
         shadeIntoVertexBuffer(position_ssbo, velocity_ssbo, mass_ssbo, 0, count);
         last_particle_count = particles.size();
         needs_update = false;
